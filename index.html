@@ -1,0 +1,1812 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>競輪グランプリ</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;display:flex;justify-content:center;align-items:center;height:100vh}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ===== SETUP =====
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ===== CONSTANTS =====
+const TL = 400; // track length
+const STR = 80; // straight length
+const CRV = 120; // curve arc length
+const CR = CRV / Math.PI; // curve radius ~38.2m
+const HS = STR / 2; // half straight = 40
+const TW = 8; // track width meters
+const NLANES = 5;
+const LW = TW / NLANES; // lane width
+const TOTAL_LAPS = 3;
+const PACER_LAPS = 1;
+const NUM_CYCLISTS = 7;
+
+const BASE_SPEED = 13.5;
+const MAX_SPEED = 20;
+const MIN_SPEED = 8;
+const EMPTY_SPEED = 11;
+const STAMINA_MAX = 67;
+const STAMINA_DRAIN = 0.06;   // 速度比例の基本消費係数
+const SLIP_MULTIPLIER = 0.5;  // スリップ時: 消費50%減
+const WIND_PENALTY = 1.6;     // 前に誰もいない時: 消費60%増
+const SLIP_DIST = 5;
+const LANE_SPEED = 3.5;
+const CLIMB_DRAIN = 3.0; // 1m登るごとの体力消費
+const ACCEL_RATE = 4.0;       // ↑キーでの加速力 (m/s²)
+const DECEL_RATE = 3.0;       // ↓キーでの減速力 (m/s²)
+const AIR_DRAG = 0.008;       // 空気抵抗係数 (風よけなし時)
+const AIR_DRAG_SLIP = 0.001;  // 空気抵抗係数 (スリップ時)
+const AIR_DRAG_COVER = 0.003; // 空気抵抗係数 (前方に選手あり)
+
+const CAM_DIST = 14;
+const CAM_H = 7;
+const CAM_LOOK = 18;
+
+// ===== TRACK MATH =====
+const TRACK_OFFSET = 40; // スタート/ゴールを6時の位置(下端中央)にする
+function trackPos(t) {
+  t = (((t + TRACK_OFFSET) % TL) + TL) % TL;
+  if (t < STR) return { x: HS - t, z: -CR };
+  if (t < STR + CRV) {
+    const a = -Math.PI/2 - (t - STR) / CRV * Math.PI;
+    return { x: -HS + CR * Math.cos(a), z: CR * Math.sin(a) };
+  }
+  if (t < 2*STR + CRV) return { x: -HS + (t - STR - CRV), z: CR };
+  const a = Math.PI/2 - (t - 2*STR - CRV) / CRV * Math.PI;
+  return { x: HS + CR * Math.cos(a), z: CR * Math.sin(a) };
+}
+
+function trackDir(t) {
+  t = (((t + TRACK_OFFSET) % TL) + TL) % TL;
+  if (t < STR) return { x: -1, z: 0 };
+  if (t < STR + CRV) {
+    const a = -Math.PI/2 - (t - STR) / CRV * Math.PI;
+    return { x: Math.sin(a), z: -Math.cos(a) };
+  }
+  if (t < 2*STR + CRV) return { x: 1, z: 0 };
+  const a = Math.PI/2 - (t - 2*STR - CRV) / CRV * Math.PI;
+  return { x: Math.sin(a), z: -Math.cos(a) };
+}
+
+function trackNorm(t) {
+  const d = trackDir(t);
+  return { x: d.z, z: -d.x };
+}
+
+function getBanking(t) {
+  t = (((t + TRACK_OFFSET) % TL) + TL) % TL;
+  const BANK_STRAIGHT = 0.061; // 直線部 (~3.5°)
+  const BANK_CURVE = 0.611;    // カーブ (~35°)
+  if (t < STR) return BANK_STRAIGHT;
+  if (t < STR + CRV) {
+    const p = (t - STR) / CRV;
+    const curve = Math.sin(p * Math.PI);
+    return BANK_STRAIGHT + (BANK_CURVE - BANK_STRAIGHT) * curve;
+  }
+  if (t < 2*STR + CRV) return BANK_STRAIGHT;
+  const p = (t - 2*STR - CRV) / CRV;
+  const curve = Math.sin(p * Math.PI);
+  return BANK_STRAIGHT + (BANK_CURVE - BANK_STRAIGHT) * curve;
+}
+
+function worldPos(dist, lane) {
+  const t = ((dist % TL) + TL) % TL;
+  const pos = trackPos(t);
+  const norm = trackNorm(t);
+  const bank = getBanking(t);
+  const offset = (3 - lane) * LW;
+  const hOff = offset * Math.cos(bank);
+  const y = -offset * Math.sin(bank);
+  return {
+    x: pos.x + norm.x * hOff,
+    y: y,
+    z: pos.z + norm.z * hOff
+  };
+}
+
+// ===== 3D PROJECTION =====
+function buildCamera(playerDist, playerLane) {
+  const pPos = worldPos(playerDist, playerLane);
+  const t = ((playerDist % TL) + TL) % TL;
+  const dir = trackDir(t);
+  const camX = pPos.x - dir.x * CAM_DIST;
+  const camY = pPos.y + CAM_H;
+  const camZ = pPos.z - dir.z * CAM_DIST;
+  const lookPos = worldPos(playerDist + CAM_LOOK, playerLane);
+  const lookX = lookPos.x;
+  const lookY = lookPos.y + 1.5;
+  const lookZ = lookPos.z;
+  // Forward
+  let fx = lookX - camX, fy = lookY - camY, fz = lookZ - camZ;
+  let fl = Math.sqrt(fx*fx + fy*fy + fz*fz);
+  fx /= fl; fy /= fl; fz /= fl;
+  // Right = forward x up(0,1,0)
+  let rx = -fz, ry = 0, rz = fx;
+  let rl = Math.sqrt(rx*rx + rz*rz);
+  rx /= rl; rz /= rl;
+  // Up = right x forward
+  let ux = ry*fz - rz*fy, uy = rz*fx - rx*fz, uz = rx*fy - ry*fx;
+  return { px: camX, py: camY, pz: camZ, fx, fy, fz, rx, ry, rz, ux, uy, uz };
+}
+
+function project(wx, wy, wz, cam) {
+  const dx = wx - cam.px, dy = wy - cam.py, dz = wz - cam.pz;
+  const cz = dx*cam.fx + dy*cam.fy + dz*cam.fz;
+  if (cz < 0.5) return null;
+  const cx = dx*cam.rx + dy*cam.ry + dz*cam.rz;
+  const cy = dx*cam.ux + dy*cam.uy + dz*cam.uz;
+  const fov = canvas.width * 0.75;
+  const scale = fov / cz;
+  return {
+    sx: canvas.width/2 + cx * scale,
+    sy: canvas.height/2 - cy * scale,
+    scale: scale,
+    depth: cz
+  };
+}
+
+// ===== CYCLIST COLORS =====
+const COLORS = [
+  { main: '#FFFFFF', dark: '#BBBBBB', name: '1番 白', helmet: '#EEEEEE' },
+  { main: '#111111', dark: '#000000', name: '2番 黒', helmet: '#333333' },
+  { main: '#EE1111', dark: '#AA0000', name: '3番 赤', helmet: '#FF3333' },
+  { main: '#1155EE', dark: '#0033AA', name: '4番 青', helmet: '#3377FF' },
+  { main: '#DDCC00', dark: '#AA9900', name: '5番 黄', helmet: '#FFEE33' },
+  { main: '#11AA33', dark: '#007722', name: '6番 緑', helmet: '#33CC55' },
+  { main: '#EE7700', dark: '#BB5500', name: '7番 橙', helmet: '#FF9933' },
+];
+const PACER_COLOR = { main: '#9933CC', dark: '#6622AA', name: '誘導員', helmet: '#BB55EE' };
+
+// ===== GAME STATE =====
+let state = 'TITLE';
+let cyclists = [];
+let pacer = null;
+let playerIdx = 0;
+let raceTime = 0;
+let countdown = 0;
+let message = '';
+let msgTimer = 0;
+let lineFormation = 0; // 0=3/3/1, 1=3/2/2, 2=2/2/2/1
+let linePositions = [];
+let selectedFormation = 0;
+let selectedPosition = 0;
+let selectPhase = 0; // 0=formation, 1=position
+let finishOrder = [];
+let pacerActive = true;
+let paused = false;
+let keyJust = { up: false, down: false, left: false, right: false };
+
+const FORMATIONS = [
+  { name: '3-3-1', groups: [3, 3, 1] },
+  { name: '3-2-2', groups: [3, 2, 2] },
+  { name: '2-2-2-1', groups: [2, 2, 2, 1] },
+];
+
+// ===== INPUT =====
+const keys = { up: false, down: false, left: false, right: false };
+const prevKeys = { up: false, down: false, left: false, right: false };
+
+document.addEventListener('keydown', e => {
+  if (e.key === ' ') {
+    if (state === 'RACING' || state === 'COUNTDOWN') paused = !paused;
+    e.preventDefault();
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (state === 'RACING' || state === 'COUNTDOWN' || state === 'RESULT') {
+      state = 'LINE_SELECT';
+      selectPhase = 0;
+      paused = false;
+    }
+    e.preventDefault();
+    return;
+  }
+  if (e.key === 'ArrowUp') keys.up = true;
+  if (e.key === 'ArrowDown') keys.down = true;
+  if (e.key === 'ArrowLeft') keys.left = true;
+  if (e.key === 'ArrowRight') keys.right = true;
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  if (e.key === 'ArrowUp') keys.up = false;
+  if (e.key === 'ArrowDown') keys.down = false;
+  if (e.key === 'ArrowLeft') keys.left = false;
+  if (e.key === 'ArrowRight') keys.right = false;
+});
+
+function justPressed(key) {
+  return keys[key] && !prevKeys[key];
+}
+
+// ===== CYCLIST =====
+function createCyclist(idx, dist, lane, isPlayer) {
+  return {
+    idx, dist, lane, speed: 0, stamina: STAMINA_MAX,
+    targetLane: lane, isPlayer, prevY: 0, prevSpeed: 0,
+    color: COLORS[idx],
+    finished: false, finishTime: 0,
+    // 戦法: 先頭用 'senkou'(先行) or 'makuri'(まくり)
+    //        番手用 'oikomi'(追込) or 'kirikae'(切替)
+    aiTactic: '',
+    aiAggression: 0.7 + Math.random() * 0.3,
+    lineGroup: 0, linePos: 0,
+    abandoned: false, // 番手がラインを見切ったフラグ
+  };
+}
+
+function createPacer() {
+  return {
+    dist: 0, lane: 1.8, speed: 0, // 赤線（スプリンターライン）上を走る
+    color: PACER_COLOR, active: true,
+    departing: false, departTimer: 0,
+  };
+}
+
+// ===== INITIALIZE RACE =====
+function initRace() {
+  const form = FORMATIONS[selectedFormation];
+  cyclists = [];
+  finishOrder = [];
+  pacerActive = true;
+  raceTime = 0;
+  message = '';
+  msgTimer = 0;
+
+  // Build position assignments
+  let positions = [];
+  let gIdx = 0;
+  let posInRace = 0;
+  for (let g = 0; g < form.groups.length; g++) {
+    for (let p = 0; p < form.groups[g]; p++) {
+      positions.push({ group: g, posInGroup: p, raceOrder: posInRace++ });
+    }
+  }
+
+  // Player gets selectedPosition
+  let playerAssignment = positions[selectedPosition];
+
+  // 横並びに発走機配置（全員同じ距離、レーンで分ける）
+  const laneAssignments = [];
+  for (let i = 0; i < NUM_CYCLISTS; i++) {
+    let assignment;
+    if (i === 0) {
+      assignment = playerAssignment;
+    } else {
+      let availPositions = positions.filter((_, idx) => idx !== selectedPosition);
+      assignment = availPositions[i - 1];
+    }
+    laneAssignments.push(assignment);
+  }
+  // レーンを均等に割り当て（1〜7番 → レーン位置を均等配分）
+  const sortedByOrder = laneAssignments.map((a, i) => ({ a, i })).sort((a, b) => a.a.raceOrder - b.a.raceOrder);
+  for (let si = 0; si < sortedByOrder.length; si++) {
+    const { a: assignment, i } = sortedByOrder[si];
+    const startDist = 0;
+    const startLane = 1 + (si / (NUM_CYCLISTS - 1)) * (NLANES - 1); // 1〜5に均等配置
+    const c = createCyclist(i, startDist, startLane, i === 0);
+    c.speed = 0;
+    c.lineGroup = assignment.group;
+    c.linePos = assignment.posInGroup;
+    cyclists.push(c);
+  }
+  playerIdx = 0;
+
+  // 戦法の割り当て
+  // ライン先頭: senkou(先行), makuri(まくり), makuri_oikomi(捲り追込), tsuppari(突っ張り先行)
+  const lineLeaders = cyclists.filter(c => !c.isPlayer && c.linePos === 0);
+  const leaderTactics = ['senkou', 'makuri', 'makuri_oikomi', 'tsuppari'];
+  lineLeaders.forEach(c => {
+    c.aiTactic = leaderTactics[Math.floor(Math.random() * leaderTactics.length)];
+  });
+  // 最低1人は先行型を保証
+  if (!lineLeaders.some(c => c.aiTactic === 'senkou' || c.aiTactic === 'tsuppari')) {
+    lineLeaders[0].aiTactic = 'senkou';
+  }
+  // 番手・3番手: oikomi(追込), sashi(差し), kirikae(切替)
+  cyclists.filter(c => !c.isPlayer && c.linePos > 0).forEach(c => {
+    const r = Math.random();
+    if (r < 0.2) c.aiTactic = 'kirikae';
+    else if (r < 0.5) c.aiTactic = 'sashi';
+    else c.aiTactic = 'oikomi';
+  });
+
+  pacer = createPacer();
+  pacer.dist = 10;
+  pacer.speed = 0;
+
+  state = 'COUNTDOWN';
+  countdown = 3.5;
+}
+
+// ===== SLIPSTREAM CHECK =====
+function inSlipstream(cyclist) {
+  for (const other of cyclists) {
+    if (other === cyclist || other.finished) continue;
+    const distAhead = other.dist - cyclist.dist;
+    if (distAhead > 0.5 && distAhead < SLIP_DIST) {
+      if (Math.abs(other.lane - cyclist.lane) < 0.8) return true;
+    }
+  }
+  if (pacer && pacer.active) {
+    const distAhead = pacer.dist - cyclist.dist;
+    if (distAhead > 0.5 && distAhead < SLIP_DIST) {
+      if (Math.abs(pacer.lane - cyclist.lane) < 0.8) return true;
+    }
+  }
+  return false;
+}
+
+// ===== WIND COVER CHECK =====
+function hasAnyoneAhead(cyclist) {
+  for (const other of cyclists) {
+    if (other === cyclist || other.finished) continue;
+    const distAhead = other.dist - cyclist.dist;
+    if (distAhead > 0.5 && distAhead < 10 && Math.abs(other.lane - cyclist.lane) < 1.5) return true;
+  }
+  if (pacer && pacer.active) {
+    const distAhead = pacer.dist - cyclist.dist;
+    if (distAhead > 0.5 && distAhead < 10 && Math.abs(pacer.lane - cyclist.lane) < 1.5) return true;
+  }
+  return false;
+}
+
+// ===== COLLISION CHECK =====
+function isBlocked(cyclist, newLane) {
+  const BODY_LENGTH = 1.8;  // 前後の占有距離
+  const BODY_WIDTH = 0.9;   // 横幅（レーン幅の半分強）
+  for (const other of cyclists) {
+    if (other === cyclist) continue;
+    // 同じラインの選手同士はブロックしない（追従ロジックでついてくる）
+    if (other.lineGroup === cyclist.lineGroup) continue;
+    // 自分より後ろにいる選手はブロックしない（前方の選手だけ判定）
+    const distDiff = other.dist - cyclist.dist;
+    if (distDiff < -0.5) continue;
+    const dd = Math.abs(distDiff);
+    if (dd < BODY_LENGTH && Math.abs(other.lane - newLane) < BODY_WIDTH) return true;
+  }
+  if (pacer && pacer.active) {
+    const dd = Math.abs(pacer.dist - cyclist.dist);
+    if (dd < BODY_LENGTH && Math.abs(pacer.lane - newLane) < BODY_WIDTH) return true;
+  }
+  return false;
+}
+
+// ===== UPDATE =====
+function update(dt) {
+  if (state === 'COUNTDOWN') {
+    countdown -= dt;
+    if (countdown <= 0) {
+      state = 'RACING';
+      showMessage('スタート！', 2);
+    }
+    // 発走機で静止
+    return;
+  }
+  if (state !== 'RACING') return;
+
+  raceTime += dt;
+  const player = cyclists[playerIdx];
+  const playerLap = Math.floor(player.dist / TL);
+  const sprintPhase = playerLap >= PACER_LAPS;
+
+  // Pacer logic
+  if (pacer.active) {
+    if (sprintPhase && !pacer.departing) {
+      pacer.departing = true;
+      pacer.departTimer = 0;
+      showMessage('残り2周！先頭誘導員退避！', 3);
+    }
+    if (pacer.departing) {
+      pacer.departTimer += dt;
+      pacer.lane += dt * 4;
+      pacer.speed = Math.max(pacer.speed - dt * 3, 5);
+      if (pacer.departTimer > 3) pacer.active = false;
+    } else {
+      // Pacer: 0→30km/h(1/3周), 30→40km/h(残り2周時点)
+      const pacerDist = pacer.dist;
+      const phase1End = TL / 8;           // 1/8周
+      const phase2End = TL * PACER_LAPS;  // 誘導終了
+      const speed30 = 30 / 3.6;  // 8.33 m/s
+      const speed40 = 40 / 3.6;  // 11.11 m/s
+      let targetSpeed;
+      if (pacerDist < phase1End) {
+        // 0 → 30km/h
+        const p = pacerDist / phase1End;
+        targetSpeed = speed30 * p;
+      } else {
+        // 30 → 40km/h
+        const p = Math.min(1, (pacerDist - phase1End) / (phase2End - phase1End));
+        targetSpeed = speed30 + (speed40 - speed30) * p;
+      }
+      pacer.speed += (targetSpeed - pacer.speed) * Math.min(1, dt * 3);
+    }
+    pacer.dist += pacer.speed * dt;
+  }
+
+  // Check for final lap message
+  if (playerLap === TOTAL_LAPS - 1 && msgTimer <= 0) {
+    // Only show if we haven't shown it yet
+    if (player.dist >= TL * (TOTAL_LAPS - 1) && player.dist < TL * (TOTAL_LAPS - 1) + 2) {
+      showMessage('ファイナルラップ！', 2.5);
+    }
+  }
+
+  // スプリントフェーズは全選手共通（誘導員退避で切り替わる）
+  const raceSprintPhase = !pacer.active || pacer.departing;
+
+  // Update each cyclist
+  for (const c of cyclists) {
+    if (c.finished) continue;
+
+    const slip = inSlipstream(c);
+
+    if (c.isPlayer) {
+      // Player controls
+      if (raceSprintPhase) {
+        // Speed control: 上で加速、下で減速、離すと速度維持（空気抵抗で徐々に減速）
+        if (keys.up && c.stamina > 0) {
+          c.speed = Math.min(MAX_SPEED, c.speed + ACCEL_RATE * dt);
+        } else if (keys.down) {
+          c.speed = Math.max(MIN_SPEED, c.speed - DECEL_RATE * dt);
+        }
+        // 空気抵抗による自然減速（速度の2乗に比例）
+        let drag;
+        if (slip) drag = AIR_DRAG_SLIP;
+        else if (hasAnyoneAhead(c)) drag = AIR_DRAG_COVER;
+        else drag = AIR_DRAG;
+        c.speed = Math.max(MIN_SPEED, c.speed - drag * c.speed * c.speed * dt);
+
+        if (c.stamina <= 0) c.speed = Math.min(c.speed, EMPTY_SPEED);
+
+        // Stamina
+        let drain = c.speed * STAMINA_DRAIN * dt;
+        if (slip) drain *= SLIP_MULTIPLIER;
+        else if (!hasAnyoneAhead(c)) drain *= WIND_PENALTY;
+        c.stamina = Math.max(0, c.stamina - drain);
+      } else {
+        // 誘導中: 自由に加減速できるが、誘導員は追い抜けない
+        if (keys.up) {
+          c.speed = Math.min(MAX_SPEED, c.speed + ACCEL_RATE * dt);
+        } else if (keys.down) {
+          c.speed = Math.max(0, c.speed - DECEL_RATE * dt);
+        }
+        // 空気抵抗による自然減速
+        let drag;
+        if (slip) drag = AIR_DRAG_SLIP;
+        else if (hasAnyoneAhead(c)) drag = AIR_DRAG_COVER;
+        else drag = AIR_DRAG;
+        c.speed = Math.max(0, c.speed - drag * c.speed * c.speed * dt);
+        // 誘導員を追い抜かない: 距離が近づくほど減速（ただし最低限の速度は出せる）
+        const distToPacer = pacer.dist - c.dist;
+        if (distToPacer < 3 && distToPacer > 0) {
+          const maxSpd = pacer.speed * (distToPacer / 3);
+          c.speed = Math.min(c.speed, Math.max(maxSpd, pacer.speed * 0.5));
+        } else if (distToPacer <= 0) {
+          c.speed = Math.min(c.speed, pacer.speed * 0.5);
+        }
+      }
+
+      // Lane control
+      if (keys.left) {
+        const newLane = c.lane - LANE_SPEED * dt;
+        if (!isBlocked(c, newLane)) c.lane = Math.max(1, newLane);
+      }
+      if (keys.right) {
+        const newLane = c.lane + LANE_SPEED * dt;
+        if (!isBlocked(c, newLane)) c.lane = Math.min(NLANES, newLane);
+      }
+    } else {
+      // AI
+      if (raceSprintPhase) {
+        updateAI(c, dt, slip);
+      } else {
+        // 誘導中: 番手・3番手はライン内の前の選手を追従
+        const lineAhead = getLineAhead(c);
+        if (c.linePos > 0 && lineAhead) {
+          // ライン前方選手を追走（距離・レーン共に）
+          const gap = lineAhead.dist - c.dist;
+          const idealGap = FOLLOW_GAP;
+          const gapError = gap - idealGap;
+          let targetSpeed = lineAhead.speed + gapError * 4.0;
+          // ライン前方選手についていく（誘導員速度でキャップしない）
+          targetSpeed = Math.max(0, Math.min(targetSpeed, MAX_SPEED));
+          c.speed += (targetSpeed - c.speed) * Math.min(1, dt / REACTION_DELAY);
+          // ただし誘導員を追い抜かない
+          const distToPacer = pacer.dist - c.dist;
+          if (distToPacer < 3 && distToPacer > 0) {
+            c.speed = Math.min(c.speed, Math.max(pacer.speed * (distToPacer / 3), pacer.speed * 0.5));
+          } else if (distToPacer <= 0) {
+            c.speed = Math.min(c.speed, pacer.speed * 0.5);
+          }
+          // レーン追従
+          const laneDiff = lineAhead.lane - c.lane;
+          if (Math.abs(laneDiff) > 0.05) {
+            const move = Math.min(Math.abs(laneDiff), LANE_SPEED * dt) * Math.sign(laneDiff);
+            const nl = c.lane + move;
+            if (!isBlocked(c, nl)) c.lane = Math.max(1, Math.min(NLANES, nl));
+          }
+        } else {
+          // ライン先頭AI: 誘導員についていく
+          const targetDist = pacer.dist - 3 - c.lineGroup * 3;
+          const distDiff = targetDist - c.dist;
+          let targetSpeed = pacer.speed + distDiff * 2.0;
+          targetSpeed = Math.max(0, Math.min(targetSpeed, pacer.speed + 2));
+          c.speed += (targetSpeed - c.speed) * Math.min(1, dt * 3);
+          // 誘導員を追い抜かない
+          if (c.dist > pacer.dist - 2) {
+            c.speed = Math.min(c.speed, pacer.speed * 0.85);
+          }
+          // フォーメーションレーン
+          const formLane = 2 + c.lineGroup * 0.8;
+          if (c.lane < formLane - 0.1) c.lane += LANE_SPEED * 0.5 * dt;
+          if (c.lane > formLane + 0.1) c.lane -= LANE_SPEED * 0.5 * dt;
+        }
+      }
+    }
+
+    c.dist += c.speed * dt;
+
+    // 同レーンの前方選手をすり抜けない（横に出さないと抜けない）
+    for (const other of cyclists) {
+      if (other === c || other.finished) continue;
+      if (other.lineGroup === c.lineGroup) continue; // 同ラインは除外
+      const laneDiff = Math.abs(other.lane - c.lane);
+      if (laneDiff < 0.9) { // 同レーンにいる場合
+        const distAhead = other.dist - c.dist;
+        if (distAhead > -0.3 && distAhead < 1.8) {
+          // 前方に選手がいる → その後ろに留める
+          c.dist = Math.min(c.dist, other.dist - 1.8);
+          c.speed = Math.min(c.speed, other.speed);
+        }
+      }
+    }
+
+    // 位置エネルギーによる体力消費（登ると消耗、下ると回復なし）
+    const curY = worldPos(c.dist, c.lane).y;
+    const deltaY = curY - c.prevY;
+    if (deltaY > 0) {
+      c.stamina = Math.max(0, c.stamina - deltaY * CLIMB_DRAIN);
+    }
+    c.prevY = curY;
+    c.prevSpeed = c.speed;
+
+    // Finish check
+    if (c.dist >= TL * TOTAL_LAPS) {
+      c.finished = true;
+      c.finishTime = raceTime;
+      finishOrder.push(c.idx);
+    }
+  }
+
+  // Check if race is over (all finished or player finished)
+  if (player.finished) {
+    // Wait a moment then show results
+    let allDone = cyclists.every(c => c.finished);
+    if (!allDone) {
+      // Force finish remaining
+      for (const c of cyclists) {
+        if (!c.finished) {
+          c.finished = true;
+          c.finishTime = raceTime + (TL * TOTAL_LAPS - c.dist) / Math.max(c.speed, 5);
+          finishOrder.push(c.idx);
+        }
+      }
+    }
+    setTimeout(() => { if (state === 'RACING') state = 'RESULT'; }, 2000);
+  }
+}
+
+// ===== AI =====
+// ライン先頭の選手を取得
+function getLineLeader(c) {
+  let leader = null;
+  for (const other of cyclists) {
+    if (other === c || other.finished) continue;
+    if (other.lineGroup === c.lineGroup && other.linePos === 0) {
+      leader = other;
+      break;
+    }
+  }
+  return leader;
+}
+
+// ライン内で自分の直前の選手を取得
+function getLineAhead(c) {
+  let ahead = null;
+  for (const other of cyclists) {
+    if (other === c || other.finished) continue;
+    if (other.lineGroup === c.lineGroup && other.linePos === c.linePos - 1) {
+      ahead = other;
+      break;
+    }
+  }
+  return ahead;
+}
+
+const REACTION_DELAY = 0.12; // 反応遅延（秒）— 短いがゼロではない
+const FOLLOW_GAP = 1.5;      // 理想的な車間距離（m）— タイヤ1つ分程度
+
+function updateAI(c, dt, slip) {
+  const remaining = TL * TOTAL_LAPS - c.dist;
+
+  // ラスト1/4周: 全員ライン解散、個人で全力スプリント
+  if (remaining <= TL * 0.25) {
+    updateFinalSprint(c, dt, slip, remaining);
+    return;
+  }
+
+  // 番手・3番手（ラインを見切っていない場合）
+  if (c.linePos > 0 && !c.abandoned && c.stamina > 5) {
+    const ahead = getLineAhead(c);
+    if (ahead && !ahead.finished) {
+      updateFollower(c, ahead, dt, slip, remaining);
+      return;
+    }
+  }
+
+  // ライン先頭 / 単騎
+  if (c.linePos === 0) {
+    updateLeader(c, dt, slip, remaining);
+  } else {
+    // ラインを見切った or 前がいない → 独力
+    updateIndependent(c, dt, slip, remaining);
+  }
+}
+
+function updateFollower(c, ahead, dt, slip, remaining) {
+  const leader = getLineLeader(c);
+
+  // === 切替型: ラインを見切るか判断 ===
+  if (c.aiTactic === 'kirikae' && leader && remaining < TL * 1.2) {
+    const leaderStamina = leader.stamina / STAMINA_MAX;
+    const leaderPos = getPositionOf(leader);
+    if (leaderStamina < 0.15 || (leaderPos >= 5 && remaining < TL * 0.8)) {
+      c.abandoned = true;
+      return;
+    }
+  }
+
+  // === 差し型: 残り1/3周で先頭を交わしにいく ===
+  if (c.aiTactic === 'sashi' && remaining < TL * 0.35 && c.stamina > 10) {
+    // ライン先頭を超える速度で差しにいく
+    const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
+    let targetSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 0.5))));
+    applySpeed(c, targetSpeed, dt, slip);
+    // 差しはインコースから: 前の選手より内側を狙う
+    const sashiLane = Math.max(1, ahead.lane - 1.2);
+    const laneDiff = sashiLane - c.lane;
+    if (Math.abs(laneDiff) > 0.1) {
+      const nl = c.lane + Math.sign(laneDiff) * LANE_SPEED * 0.9 * dt;
+      if (!isBlocked(c, nl)) c.lane = Math.max(1, Math.min(NLANES, nl));
+    }
+    return;
+  }
+
+  // === 速度: 前の選手に忠実に追従 ===
+  const gap = ahead.dist - c.dist;
+  const spurtZone = remaining < TL * 0.35;
+  const idealGap = spurtZone ? FOLLOW_GAP * 0.8 : FOLLOW_GAP;
+  const gapError = gap - idealGap;
+  let targetSpeed = ahead.speed + gapError * 5.0;
+
+  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, EMPTY_SPEED);
+  targetSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, targetSpeed));
+
+  const smoothing = Math.min(1, dt / REACTION_DELAY);
+  c.speed += (targetSpeed - c.speed) * smoothing;
+
+  // === 体力消費 ===
+  let drain = c.speed * STAMINA_DRAIN * dt;
+  if (slip) drain *= SLIP_MULTIPLIER;
+  else if (!hasAnyoneAhead(c)) drain *= WIND_PENALTY;
+  c.stamina = Math.max(0, c.stamina - drain);
+
+  // === レーン: 前の選手に忠実に追従 ===
+  const laneDiff = ahead.lane - c.lane;
+  if (Math.abs(laneDiff) > 0.05) {
+    const move = Math.min(Math.abs(laneDiff), LANE_SPEED * dt) * Math.sign(laneDiff);
+    const nl = c.lane + move;
+    if (!isBlocked(c, nl)) c.lane = Math.max(1, Math.min(NLANES, nl));
+  }
+}
+
+function updateLeader(c, dt, slip, remaining) {
+  let targetSpeed;
+  const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
+  const burnSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 1))));
+
+  if (c.aiTactic === 'senkou') {
+    // === 先行: 誘導退避後すぐに前に出て逃げ切りを狙う ===
+    if (remaining > TL * 1.5) {
+      const intensity = c.aiAggression * 0.75;
+      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+    } else if (remaining > TL * 0.5) {
+      const staminaRatio = c.stamina / STAMINA_MAX;
+      const intensity = c.aiAggression * Math.min(0.7, staminaRatio);
+      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+    } else {
+      targetSpeed = burnSpeed;
+    }
+
+  } else if (c.aiTactic === 'tsuppari') {
+    // === 突っ張り先行: 先行と似ているが、追いつかれても粘る ===
+    if (remaining > TL * 1.5) {
+      // 先行開始（やや控えめに入る）
+      const intensity = c.aiAggression * 0.65;
+      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+    } else if (remaining > TL * 0.5) {
+      // 後ろから追い上げがあっても踏み続ける
+      const staminaRatio = c.stamina / STAMINA_MAX;
+      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * c.aiAggression * Math.min(0.65, staminaRatio);
+      // 後ろから来たら意地でも上げる
+      let chaserSpeed = 0;
+      for (const other of cyclists) {
+        if (other === c || other.finished) continue;
+        const d = other.dist - c.dist;
+        if (d > -8 && d < 0 && other.speed > chaserSpeed) chaserSpeed = other.speed;
+      }
+      if (chaserSpeed > c.speed - 1 && c.stamina > 5) {
+        targetSpeed = Math.max(targetSpeed, chaserSpeed + 0.5);
+      }
+    } else {
+      targetSpeed = burnSpeed;
+    }
+
+  } else if (c.aiTactic === 'makuri') {
+    // === まくり: 他ラインに先行させ、残り1周あたりから外から一気にまくる ===
+    if (remaining > TL * 1.0) {
+      targetSpeed = BASE_SPEED + (slip ? 0.3 : 1.0);
+    } else if (remaining > TL * 0.5) {
+      const progress = 1 - (remaining - TL * 0.5) / (TL * 0.5);
+      const intensity = c.aiAggression * (0.5 + progress * 0.5);
+      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+    } else {
+      targetSpeed = burnSpeed;
+    }
+
+  } else {
+    // === 捲り追込み(makuri_oikomi): まくりよりさらに遅いタイミングで仕掛ける ===
+    if (remaining > TL * 0.7) {
+      // 長く温存、3〜4番手あたりでスリップ
+      targetSpeed = BASE_SPEED + (slip ? 0.2 : 0.8);
+    } else if (remaining > TL * 0.35) {
+      // 仕掛け開始: 一気に外からまくる
+      const progress = 1 - (remaining - TL * 0.35) / (TL * 0.35);
+      const intensity = c.aiAggression * (0.6 + progress * 0.4);
+      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+    } else {
+      targetSpeed = burnSpeed;
+    }
+  }
+
+  // 周囲への反応: 誰かがスパートしたら対応
+  let fastestNearby = 0;
+  for (const other of cyclists) {
+    if (other === c || other.finished) continue;
+    const d = other.dist - c.dist;
+    if (d > -5 && d < 15 && other.speed > fastestNearby) fastestNearby = other.speed;
+  }
+  if (fastestNearby > c.speed + 2 && c.stamina > 5) {
+    targetSpeed = Math.max(targetSpeed, fastestNearby - 0.3);
+  }
+
+  applySpeed(c, targetSpeed, dt, slip);
+  applyLane(c, dt);
+}
+
+// ===== ラインを見切った番手 / 独力走行 =====
+function updateIndependent(c, dt, slip, remaining) {
+  let targetSpeed;
+  if (remaining > TL * 0.5) {
+    const staminaRatio = c.stamina / STAMINA_MAX;
+    const intensity = c.aiAggression * staminaRatio * 0.6;
+    targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+    if (slip) targetSpeed = Math.min(targetSpeed, BASE_SPEED + 2);
+  } else {
+    const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
+    targetSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 1))));
+  }
+  let fastestNearby = 0;
+  for (const other of cyclists) {
+    if (other === c || other.finished) continue;
+    const d = other.dist - c.dist;
+    if (d > -5 && d < 15 && other.speed > fastestNearby) fastestNearby = other.speed;
+  }
+  if (fastestNearby > c.speed + 2 && c.stamina > 5) {
+    targetSpeed = Math.max(targetSpeed, fastestNearby - 0.3);
+  }
+  applySpeed(c, targetSpeed, dt, slip);
+  applyLane(c, dt);
+}
+
+// ===== ラスト1/4周: 全員全力スプリント =====
+function updateFinalSprint(c, dt, slip, remaining) {
+  const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
+  let targetSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 0.5))));
+  if (c.stamina <= 0) targetSpeed = EMPTY_SPEED;
+  applySpeed(c, targetSpeed, dt, slip);
+  applyLane(c, dt);
+}
+
+// ===== 速度適用（共通） =====
+function applySpeed(c, targetSpeed, dt, slip) {
+  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, EMPTY_SPEED);
+  targetSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, targetSpeed));
+  c.speed += (targetSpeed - c.speed) * Math.min(1, dt * 3);
+  let drain = c.speed * STAMINA_DRAIN * dt;
+  if (slip) drain *= SLIP_MULTIPLIER;
+  else if (!hasAnyoneAhead(c)) drain *= WIND_PENALTY;
+  c.stamina = Math.max(0, c.stamina - drain);
+}
+
+// ===== レーン適用（共通） =====
+function applyLane(c, dt) {
+  const target = getAILaneTarget(c);
+  const diff = target - c.lane;
+  if (Math.abs(diff) > 0.1) {
+    const nl = c.lane + Math.sign(diff) * LANE_SPEED * 0.9 * dt;
+    if (!isBlocked(c, nl)) c.lane = Math.max(1, Math.min(NLANES, nl));
+  }
+}
+
+function getPositionOf(c) {
+  let pos = 1;
+  for (const other of cyclists) {
+    if (other !== c && other.dist > c.dist) pos++;
+  }
+  return pos;
+}
+
+function getAILaneTarget(c) {
+  const remaining = TL * TOTAL_LAPS - c.dist;
+
+  // 前方が詰まっている → 空きレーンに出て追い抜く
+  for (const other of cyclists) {
+    if (other === c || other.finished || other.lineGroup === c.lineGroup) continue;
+    const ahead = other.dist - c.dist;
+    if (ahead > -0.3 && ahead < 3 && Math.abs(other.lane - c.lane) < 0.9) {
+      if (other.speed < c.speed - 0.5) return findOpenLane(c, 5);
+    }
+  }
+
+  // 先行型/突っ張り型: 内側の空きレーンを走る（最短距離）
+  if ((c.aiTactic === 'senkou' || c.aiTactic === 'tsuppari') && remaining > TL * 0.5) {
+    return findOpenLane(c, 8);
+  }
+
+  // まくり型: 温存中はスリップ、仕掛け時は外から
+  if (c.aiTactic === 'makuri') {
+    if (remaining > TL * 1.0) {
+      for (const other of cyclists) {
+        if (other === c) continue;
+        const ahead = other.dist - c.dist;
+        if (ahead > 1 && ahead < SLIP_DIST + 2) return other.lane;
+      }
+    } else {
+      // 外から一気にまくる
+      return findOpenLane(c, 8);
+    }
+  }
+
+  // 捲り追込み型: 長く温存、仕掛けは更に遅い
+  if (c.aiTactic === 'makuri_oikomi') {
+    if (remaining > TL * 0.7) {
+      // 後方でスリップに入る
+      for (const other of cyclists) {
+        if (other === c) continue;
+        const ahead = other.dist - c.dist;
+        if (ahead > 1 && ahead < SLIP_DIST + 3) return other.lane;
+      }
+    } else {
+      return findOpenLane(c, 6);
+    }
+  }
+
+  // デフォルト: スリップ狙い
+  if (remaining > TL * 0.3) {
+    let bestLane = c.lane, bestScore = -1;
+    for (const other of cyclists) {
+      if (other === c) continue;
+      const ahead = other.dist - c.dist;
+      if (ahead > 1 && ahead < SLIP_DIST + 2) {
+        const score = 1 / (1 + Math.abs(ahead - 2));
+        if (score > bestScore) { bestScore = score; bestLane = other.lane; }
+      }
+    }
+    if (bestScore > 0) return Math.max(1, Math.min(NLANES, bestLane));
+  }
+
+  return findOpenLane(c, 10);
+}
+
+function findOpenLane(c, lookAhead) {
+  let bestLane = c.lane;
+  let bestScore = -999;
+  for (let l = 1; l <= NLANES; l++) {
+    let clear = true;
+    for (const other of cyclists) {
+      if (other === c || other.finished) continue;
+      if (other.lineGroup === c.lineGroup) continue;
+      const ahead = other.dist - c.dist;
+      if (ahead > -1 && ahead < lookAhead && Math.abs(other.lane - l) < 0.9) {
+        clear = false; break;
+      }
+    }
+    if (clear) {
+      const score = -Math.abs(l - c.lane) * 2 - l * 0.3;
+      if (score > bestScore) { bestScore = score; bestLane = l; }
+    }
+  }
+  return Math.max(1, Math.min(NLANES, bestLane));
+}
+
+// ===== MESSAGE =====
+function showMessage(text, duration) {
+  message = text;
+  msgTimer = duration;
+}
+
+// ===== RENDER =====
+function render() {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (state === 'TITLE') return renderTitle();
+  if (state === 'LINE_SELECT') return renderLineSelect();
+  if (state === 'RESULT') return renderResult();
+
+  // Racing / Countdown
+  const player = cyclists[playerIdx];
+  const cam = buildCamera(player.dist, player.lane);
+
+  renderSky();
+  renderTrack(cam);
+  renderCyclists(cam);
+  renderHUD(player);
+  renderMinimap();
+  renderMessages();
+
+  if (state === 'COUNTDOWN') {
+    const sec = Math.ceil(countdown);
+    if (sec > 0) {
+      ctx.fillStyle = '#FFF';
+      ctx.font = `bold ${H * 0.15}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(sec, W/2, H/2);
+    }
+  }
+}
+
+function renderSky() {
+  const W = canvas.width, H = canvas.height;
+  const grad = ctx.createLinearGradient(0, 0, 0, H * 0.5);
+  grad.addColorStop(0, '#1a1a3a');
+  grad.addColorStop(1, '#2a3a5a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H * 0.5);
+  ctx.fillStyle = '#1a2a1a';
+  ctx.fillRect(0, H * 0.5, W, H * 0.5);
+}
+
+function renderTrack(cam) {
+  const segLen = 2;
+  const numSeg = TL / segLen;
+  const halfW = TW / 2;
+
+  // Collect all track quads with depth
+  let quads = [];
+  for (let i = 0; i < numSeg; i++) {
+    const t1 = i * segLen;
+    const t2 = (i + 1) * segLen;
+
+    // Track edges
+    const inner1 = worldPos(t1, 1 - 0.5);
+    const outer1 = worldPos(t1, NLANES + 0.5);
+    const inner2 = worldPos(t2, 1 - 0.5);
+    const outer2 = worldPos(t2, NLANES + 0.5);
+
+    const pi1 = project(inner1.x, inner1.y, inner1.z, cam);
+    const po1 = project(outer1.x, outer1.y, outer1.z, cam);
+    const pi2 = project(inner2.x, inner2.y, inner2.z, cam);
+    const po2 = project(outer2.x, outer2.y, outer2.z, cam);
+
+    if (!pi1 || !po1 || !pi2 || !po2) continue;
+    if (pi1.depth > 150 || po1.depth > 150) continue;
+
+    const depth = (pi1.depth + po1.depth + pi2.depth + po2.depth) / 4;
+    const stripe = Math.floor(i / 3) % 2;
+    quads.push({ pi1, po1, pi2, po2, depth, stripe, t1 });
+  }
+
+  // Sort far to near
+  quads.sort((a, b) => b.depth - a.depth);
+
+  for (const q of quads) {
+    // Track surface
+    ctx.fillStyle = q.stripe ? '#C4935A' : '#B8884F';
+    ctx.beginPath();
+    ctx.moveTo(q.pi1.sx, q.pi1.sy);
+    ctx.lineTo(q.po1.sx, q.po1.sy);
+    ctx.lineTo(q.po2.sx, q.po2.sy);
+    ctx.lineTo(q.pi2.sx, q.pi2.sy);
+    ctx.closePath();
+    ctx.fill();
+
+    // Infield (inside the track)
+    const infield1 = worldPos(q.t1, -1);
+    const infield2 = worldPos(q.t1 + 2, -1);
+    const pif1 = project(infield1.x, infield1.y, infield1.z, cam);
+    const pif2 = project(infield2.x, infield2.y, infield2.z, cam);
+    if (pif1 && pif2) {
+      ctx.fillStyle = '#2a4a2a';
+      ctx.beginPath();
+      ctx.moveTo(q.pi1.sx, q.pi1.sy);
+      ctx.lineTo(pif1.sx, pif1.sy);
+      ctx.lineTo(pif2.sx, pif2.sy);
+      ctx.lineTo(q.pi2.sx, q.pi2.sy);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Blue line (inner measurement line)
+    if (q.depth < 80) {
+      const bl1 = worldPos(q.t1, 1);
+      const bl2 = worldPos(q.t1 + 2, 1);
+      const pbl1 = project(bl1.x, bl1.y, bl1.z, cam);
+      const pbl2 = project(bl2.x, bl2.y, bl2.z, cam);
+      if (pbl1 && pbl2) {
+        ctx.strokeStyle = '#3366FF';
+        ctx.lineWidth = Math.max(1, pbl1.scale * 0.08);
+        ctx.beginPath();
+        ctx.moveTo(pbl1.sx, pbl1.sy);
+        ctx.lineTo(pbl2.sx, pbl2.sy);
+        ctx.stroke();
+      }
+
+      // Red sprinter line
+      const rl1 = worldPos(q.t1, 1.8);
+      const rl2 = worldPos(q.t1 + 2, 1.8);
+      const prl1 = project(rl1.x, rl1.y, rl1.z, cam);
+      const prl2 = project(rl2.x, rl2.y, rl2.z, cam);
+      if (prl1 && prl2) {
+        ctx.strokeStyle = '#DD2222';
+        ctx.lineWidth = Math.max(1, prl1.scale * 0.06);
+        ctx.beginPath();
+        ctx.moveTo(prl1.sx, prl1.sy);
+        ctx.lineTo(prl2.sx, prl2.sy);
+        ctx.stroke();
+      }
+    }
+
+    // Finish line
+    const finDist = 0;
+    if (q.t1 <= finDist && q.t1 + 2 > finDist) {
+      const fl_inner = worldPos(finDist, 0.5);
+      const fl_outer = worldPos(finDist, NLANES + 0.5);
+      const pfl1 = project(fl_inner.x, fl_inner.y + 0.01, fl_inner.z, cam);
+      const pfl2 = project(fl_outer.x, fl_outer.y + 0.01, fl_outer.z, cam);
+      if (pfl1 && pfl2) {
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.lineWidth = Math.max(2, pfl1.scale * 0.15);
+        ctx.beginPath();
+        ctx.moveTo(pfl1.sx, pfl1.sy);
+        ctx.lineTo(pfl2.sx, pfl2.sy);
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+function renderCyclists(cam) {
+  // Collect all drawable entities with depth
+  let entities = [];
+
+  // Pacer
+  if (pacer && pacer.active) {
+    const wp = worldPos(pacer.dist, pacer.lane);
+    const pp = project(wp.x, wp.y + 0.8, wp.z, cam);
+    if (pp && pp.depth > 0) {
+      entities.push({ proj: pp, color: pacer.color, stamina: -1, isPlayer: false, isSlip: false, dist: pacer.dist });
+    }
+  }
+
+  // Cyclists
+  for (const c of cyclists) {
+    if (c.finished && finishOrder.indexOf(c.idx) < finishOrder.indexOf(playerIdx) - 3) continue;
+    const wp = worldPos(c.dist, c.lane);
+    const pp = project(wp.x, wp.y + 0.8, wp.z, cam);
+    if (pp && pp.depth > 0) {
+      entities.push({ proj: pp, color: c.color, stamina: c.stamina, isPlayer: c.isPlayer, isSlip: inSlipstream(c), dist: c.dist, idx: c.idx, speed: c.speed, accel: c.speed - c.prevSpeed });
+    }
+  }
+
+  // Sort far to near
+  entities.sort((a, b) => b.proj.depth - a.proj.depth);
+
+  for (const e of entities) {
+    const { sx, sy, scale } = e.proj;
+    const s = Math.min(scale * 0.8, 200);
+    if (s < 2) continue;
+
+    // ペダル角度（距離に比例して回転）
+    // ペダル回転: 距離に比例（速度が速い=距離の増加が速い=ペダルが速く回る）
+    // 0.8 rad/m ≈ 1回転あたり約7.8m進む（実際の競輪のギア比に近い）
+    const pedalAngle = e.dist ? (e.dist * 0.8) % (Math.PI * 2) : 0;
+    const pedalSin = Math.sin(pedalAngle);
+    const pedalCos = Math.cos(pedalAngle);
+
+    // Sprint effect: speed lines
+    const sprintIntensity = e.speed ? (e.speed - BASE_SPEED) / (MAX_SPEED - BASE_SPEED) : 0;
+    if (sprintIntensity > 0.15 && s > 8 && e.stamina >= 0) {
+      const numLines = Math.floor(sprintIntensity * 6) + 2;
+      const alpha = Math.min(0.7, sprintIntensity * 0.8);
+      ctx.strokeStyle = `rgba(255,255,200,${alpha})`;
+      ctx.lineWidth = Math.max(1, s * 0.04);
+      for (let i = 0; i < numLines; i++) {
+        const offsetX = (Math.random() - 0.5) * s * 1.2;
+        const offsetY = (Math.random() - 0.3) * s * 0.8;
+        const len = s * (0.3 + sprintIntensity * 0.6);
+        ctx.beginPath();
+        ctx.moveTo(sx + offsetX, sy + offsetY);
+        ctx.lineTo(sx + offsetX + len * 0.3, sy + offsetY + len);
+        ctx.stroke();
+      }
+    }
+
+    // === 自転車 ===
+    const u = s * 0.07; // 基本単位（全体スケール）
+
+    // ホイール（後輪 — 後方視点なのでほぼ縦線/薄い縦楕円）
+    const wheelY = sy + u * 5;
+    const wheelRx = u * 0.6;  // 横幅は薄い（エッジオン）
+    const wheelRy = u * 3.0;  // 縦は大きい
+    ctx.strokeStyle = '#888';
+    ctx.lineWidth = Math.max(1, u * 0.5);
+    ctx.beginPath();
+    ctx.ellipse(sx, wheelY, wheelRx, wheelRy, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    // スポーク（縦方向に回転）
+    ctx.strokeStyle = '#666';
+    ctx.lineWidth = Math.max(0.5, u * 0.15);
+    for (let i = 0; i < 3; i++) {
+      const a = pedalAngle * 2 + i * Math.PI / 1.5;
+      const spY = Math.sin(a) * wheelRy * 0.85;
+      ctx.beginPath();
+      ctx.moveTo(sx, wheelY);
+      ctx.lineTo(sx, wheelY + spY);
+      ctx.stroke();
+    }
+
+    // === 脚（ペダリング — 上下方向の動き） ===
+    const hipY = sy + u * 2;
+    const hipSpread = u * 1.5; // 左右の腰幅
+    // ペダル位置は上下に動く（後方から見ると縦方向）
+    // 左脚: pedalAngleで上下
+    const lFootY = wheelY - u * 0.5 + pedalCos * u * 2.0;
+    const lKneeY = hipY + (lFootY - hipY) * 0.55 + pedalSin * u * 0.3;
+    const lKneeX = sx - hipSpread - Math.abs(pedalCos) * u * 0.5; // 膝が少し外に出る
+    const lFootX = sx - hipSpread * 0.4;
+    // 右脚: 逆位相
+    const rFootY = wheelY - u * 0.5 - pedalCos * u * 2.0;
+    const rKneeY = hipY + (rFootY - hipY) * 0.55 - pedalSin * u * 0.3;
+    const rKneeX = sx + hipSpread + Math.abs(pedalCos) * u * 0.5;
+    const rFootX = sx + hipSpread * 0.4;
+
+    const skinColor = '#D4A574';
+    const pantsColor = e.color.dark;
+    ctx.lineWidth = Math.max(1.5, u * 0.8);
+    ctx.lineCap = 'round';
+    // 左脚（太もも）
+    ctx.strokeStyle = pantsColor;
+    ctx.beginPath();
+    ctx.moveTo(sx - hipSpread, hipY);
+    ctx.lineTo(lKneeX, lKneeY);
+    ctx.stroke();
+    // 左脚（すね）
+    ctx.strokeStyle = skinColor;
+    ctx.beginPath();
+    ctx.moveTo(lKneeX, lKneeY);
+    ctx.lineTo(lFootX, lFootY);
+    ctx.stroke();
+    // 右脚（太もも）
+    ctx.strokeStyle = pantsColor;
+    ctx.beginPath();
+    ctx.moveTo(sx + hipSpread, hipY);
+    ctx.lineTo(rKneeX, rKneeY);
+    ctx.stroke();
+    // 右脚（すね）
+    ctx.strokeStyle = skinColor;
+    ctx.beginPath();
+    ctx.moveTo(rKneeX, rKneeY);
+    ctx.lineTo(rFootX, rFootY);
+    ctx.stroke();
+
+    // === 胴体（前傾姿勢） ===
+    const shoulderY = sy - u * 2;
+    const shoulderW = u * 2.5;
+    // 背中（ジャージ）
+    ctx.fillStyle = e.color.main;
+    ctx.beginPath();
+    ctx.moveTo(sx - shoulderW, shoulderY);
+    ctx.lineTo(sx + shoulderW, shoulderY);
+    ctx.lineTo(sx + hipSpread, hipY);
+    ctx.lineTo(sx - hipSpread, hipY);
+    ctx.closePath();
+    ctx.fill();
+    // ジャージの陰影
+    ctx.fillStyle = e.color.dark;
+    ctx.beginPath();
+    ctx.moveTo(sx - shoulderW * 0.3, shoulderY);
+    ctx.lineTo(sx + shoulderW * 0.3, shoulderY);
+    ctx.lineTo(sx + hipSpread * 0.3, hipY);
+    ctx.lineTo(sx - hipSpread * 0.3, hipY);
+    ctx.closePath();
+    ctx.fill();
+
+    // === 腕（ハンドルを握る） ===
+    const handY = sy + u * 0.5;
+    const elbowY = shoulderY + u * 1.5;
+    ctx.lineWidth = Math.max(1, u * 0.6);
+    ctx.lineCap = 'round';
+    // 左腕
+    ctx.strokeStyle = skinColor;
+    ctx.beginPath();
+    ctx.moveTo(sx - shoulderW, shoulderY);
+    ctx.lineTo(sx - shoulderW * 1.1, elbowY);
+    ctx.lineTo(sx - u * 1.5, handY);
+    ctx.stroke();
+    // 右腕
+    ctx.beginPath();
+    ctx.moveTo(sx + shoulderW, shoulderY);
+    ctx.lineTo(sx + shoulderW * 1.1, elbowY);
+    ctx.lineTo(sx + u * 1.5, handY);
+    ctx.stroke();
+
+    // === 頭/ヘルメット ===
+    const headR = u * 2;
+    const headY = shoulderY - headR * 0.7;
+    ctx.fillStyle = e.color.helmet;
+    ctx.beginPath();
+    ctx.ellipse(sx, headY, headR, headR * 0.85, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // ヘルメットのハイライト
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath();
+    ctx.ellipse(sx - headR * 0.2, headY - headR * 0.2, headR * 0.5, headR * 0.3, -0.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // === プレイヤーマーカー ===
+    if (e.isPlayer) {
+      const markerY = headY - headR - u * 1.5;
+      ctx.fillStyle = '#FFD700';
+      ctx.beginPath();
+      ctx.moveTo(sx, markerY);
+      ctx.lineTo(sx - u * 1.2, markerY - u * 1.5);
+      ctx.lineTo(sx + u * 1.2, markerY - u * 1.5);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // === スリップストリーム表示（頭部に描画） ===
+    if (e.isSlip && e.stamina >= 0 && s > 5) {
+      const slipAlpha = 0.5 + Math.sin(Date.now() * 0.008) * 0.15;
+      // ヘルメット周囲に水色のオーラ
+      ctx.strokeStyle = `rgba(80,180,255,${slipAlpha})`;
+      ctx.lineWidth = Math.max(1.5, u * 0.5);
+      ctx.beginPath();
+      ctx.ellipse(sx, headY, headR + u * 1.2, headR * 0.85 + u * 1.0, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      // 風の流線（頭部の左右）
+      for (let i = -1; i <= 1; i += 2) {
+        const lx = sx + i * (headR + u * 0.5);
+        ctx.beginPath();
+        ctx.moveTo(lx, headY - headR);
+        ctx.bezierCurveTo(lx + i * u * 0.8, headY, lx, headY + headR * 0.5, lx + i * u * 0.3, headY + headR + u);
+        ctx.stroke();
+      }
+      // SLIPラベル（頭上）
+      const slipFontSize = Math.max(8, u * 1.6);
+      ctx.font = `bold ${slipFontSize}px sans-serif`;
+      ctx.textAlign = 'center';
+      const slipLabelY = headY - headR - u * 1.2;
+      const slipLabelW = ctx.measureText('SLIP').width + 6;
+      ctx.fillStyle = `rgba(0,100,200,${slipAlpha * 0.8})`;
+      ctx.fillRect(sx - slipLabelW/2, slipLabelY - slipFontSize * 0.7, slipLabelW, slipFontSize * 1.0);
+      ctx.fillStyle = '#FFF';
+      ctx.fillText('SLIP', sx, slipLabelY);
+    }
+
+    // === 体力バー（太く、縁取り付き） ===
+    if (e.stamina >= 0 && s > 5) {
+      const barW = Math.max(u * 8, 20);
+      const barH = Math.max(3, u * 1.0);
+      const barDrawY = e.isPlayer ? headY - headR - u * 4 : headY - headR - u * 1.2;
+      // 外枠
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(sx - barW/2 - 1, barDrawY - 1, barW + 2, barH + 2);
+      // 背景（暗いグレー）
+      ctx.fillStyle = '#333';
+      ctx.fillRect(sx - barW/2, barDrawY, barW, barH);
+      // ゲージ本体
+      const ratio = e.stamina / STAMINA_MAX;
+      const barColor = ratio > 0.5 ? '#44EE44' : ratio > 0.2 ? '#EEEE33' : '#EE3333';
+      ctx.fillStyle = barColor;
+      ctx.fillRect(sx - barW/2, barDrawY, barW * ratio, barH);
+      // ゲージのハイライト（上端に白い線）
+      ctx.fillStyle = `rgba(255,255,255,0.3)`;
+      ctx.fillRect(sx - barW/2, barDrawY, barW * ratio, barH * 0.35);
+    }
+
+    // === 背番号 ===
+    if (s > 12 && e.idx !== undefined) {
+      ctx.fillStyle = '#FFF';
+      ctx.font = `bold ${Math.max(8, u * 2.2)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(e.idx + 1, sx, (shoulderY + hipY) / 2);
+    }
+  }
+}
+
+function renderHUD(player) {
+  const W = canvas.width, H = canvas.height;
+  const lap = Math.min(TOTAL_LAPS, Math.floor(player.dist / TL) + 1);
+  const sprintPhase = !pacer.active || pacer.departing;
+  const speed = player.speed * 3.6; // to km/h
+
+  // Lap counter (top left)
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(10, 10, 160, 50);
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText(`LAP ${lap} / ${TOTAL_LAPS}`, 20, 18);
+  ctx.font = '14px sans-serif';
+  ctx.fillStyle = sprintPhase ? '#FF6644' : '#88AAFF';
+  ctx.fillText(sprintPhase ? 'スプリント' : '誘導中', 20, 40);
+
+  // Position (top center)
+  const pos = getPlayerPosition();
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(W/2 - 60, 10, 120, 45);
+  ctx.fillStyle = pos === 1 ? '#FFD700' : pos <= 3 ? '#FF8844' : '#FFF';
+  ctx.font = 'bold 28px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${pos}位`, W/2, 38);
+
+  // Speed (top right)
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(W - 170, 10, 160, 50);
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText(`${speed.toFixed(1)} km/h`, W - 20, 38);
+
+  // Stamina bar (bottom center)
+  const barW = Math.min(400, W * 0.4);
+  const barH = 25;
+  const barX = W/2 - barW/2;
+  const barY = H - 60;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(barX - 5, barY - 25, barW + 10, barH + 35);
+  ctx.fillStyle = '#AAA';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('体力', W/2, barY - 8);
+
+  ctx.fillStyle = '#333';
+  ctx.fillRect(barX, barY, barW, barH);
+  const ratio = player.stamina / STAMINA_MAX;
+  const sc = ratio > 0.5 ? '#44DD44' : ratio > 0.2 ? '#DDDD44' : '#DD4444';
+  ctx.fillStyle = sc;
+  ctx.fillRect(barX, barY, barW * ratio, barH);
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText(`${Math.round(player.stamina / STAMINA_MAX * 100)}%`, W/2, barY + barH/2 + 5);
+
+  // Controls hint
+  if (!sprintPhase) {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 100, H - 100, 200, 25);
+    ctx.fillStyle = '#AAA';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('← → で移動', W/2, H - 85);
+  }
+}
+
+function getPlayerPosition() {
+  const player = cyclists[playerIdx];
+  let pos = 1;
+  for (const c of cyclists) {
+    if (c !== player && c.dist > player.dist) pos++;
+  }
+  return pos;
+}
+
+function renderMinimap() {
+  const W = canvas.width, H = canvas.height;
+  const mapW = 140, mapH = 100;
+  const mapX = W - mapW - 15, mapY = H - mapH - 15;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(mapX - 5, mapY - 5, mapW + 10, mapH + 10);
+
+  const cx = mapX + mapW/2, cy = mapY + mapH/2;
+  const scaleX = (mapW - 20) / (2 * (HS + CR));
+  const scaleZ = (mapH - 20) / (2 * CR);
+  const sc = Math.min(scaleX, scaleZ);
+
+  // Draw track outline
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let i = 0; i <= 200; i++) {
+    const t = (i / 200) * TL;
+    const p = trackPos(t);
+    const mx = cx - p.x * sc;
+    const my = cy - p.z * sc;
+    if (i === 0) ctx.moveTo(mx, my); else ctx.lineTo(mx, my);
+  }
+  ctx.closePath();
+  ctx.stroke();
+
+  // Draw cyclists
+  for (const c of cyclists) {
+    const t = ((c.dist % TL) + TL) % TL;
+    const p = trackPos(t);
+    const mx = cx - p.x * sc;
+    const my = cy - p.z * sc;
+
+    ctx.fillStyle = c.isPlayer ? '#FFD700' : c.color.main;
+    ctx.beginPath();
+    ctx.arc(mx, my, c.isPlayer ? 4 : 3, 0, Math.PI * 2);
+    ctx.fill();
+    if (c.isPlayer) {
+      ctx.strokeStyle = '#FFF';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  // Pacer
+  if (pacer && pacer.active) {
+    const t = ((pacer.dist % TL) + TL) % TL;
+    const p = trackPos(t);
+    const mx = cx - p.x * sc;
+    const my = cy - p.z * sc;
+    ctx.fillStyle = '#9933CC';
+    ctx.beginPath();
+    ctx.arc(mx, my, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function renderMessages() {
+  if (msgTimer > 0) {
+    const W = canvas.width, H = canvas.height;
+    const alpha = Math.min(1, msgTimer);
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    ctx.font = `bold ${H * 0.06}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle = `rgba(0,0,0,${alpha})`;
+    ctx.lineWidth = 4;
+    ctx.strokeText(message, W/2, H * 0.35);
+    ctx.fillText(message, W/2, H * 0.35);
+  }
+}
+
+// ===== TITLE SCREEN =====
+function renderTitle() {
+  const W = canvas.width, H = canvas.height;
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0a0a2a');
+  grad.addColorStop(0.5, '#1a1a4a');
+  grad.addColorStop(1, '#0a0a2a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Title
+  ctx.fillStyle = '#FFD700';
+  ctx.font = `bold ${H * 0.1}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('競輪グランプリ', W/2, H * 0.35);
+
+  // Subtitle
+  ctx.fillStyle = '#AAA';
+  ctx.font = `${H * 0.03}px sans-serif`;
+  ctx.fillText('KEIRIN GRAND PRIX', W/2, H * 0.45);
+
+  // Controls
+  ctx.fillStyle = '#FFF';
+  ctx.font = `${H * 0.025}px sans-serif`;
+  ctx.fillText('↑ 加速 ↓ 減速 ← 内側 → 外側', W/2, H * 0.6);
+
+  // Start
+  const blink = Math.sin(Date.now() / 400) > 0;
+  if (blink) {
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${H * 0.035}px sans-serif`;
+    ctx.fillText('→キーでスタート', W/2, H * 0.75);
+  }
+}
+
+// ===== LINE SELECT =====
+function renderLineSelect() {
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#0a0a2a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (selectPhase === 0) {
+    // Formation select
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${H * 0.05}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText('ライン構成を選択', W/2, H * 0.15);
+
+    for (let i = 0; i < FORMATIONS.length; i++) {
+      const y = H * 0.3 + i * H * 0.15;
+      const sel = i === selectedFormation;
+
+      ctx.fillStyle = sel ? '#FFD700' : '#666';
+      ctx.font = `bold ${H * 0.04}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(`${sel ? '▶ ' : '  '}${FORMATIONS[i].name}`, W/2, y);
+
+      // Visual
+      ctx.font = `${H * 0.025}px sans-serif`;
+      ctx.fillStyle = sel ? '#DDD' : '#555';
+      const groups = FORMATIONS[i].groups;
+      let desc = groups.map((g, gi) => `ライン${gi+1}: ${g}人`).join('  ');
+      ctx.fillText(desc, W/2, y + H * 0.04);
+    }
+
+    ctx.fillStyle = '#888';
+    ctx.font = `${H * 0.025}px sans-serif`;
+    ctx.fillText('↑↓ 選択  → 決定', W/2, H * 0.85);
+  } else {
+    // Position select
+    const form = FORMATIONS[selectedFormation];
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${H * 0.045}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`${form.name} : ポジションを選択`, W/2, H * 0.12);
+
+    let posIdx = 0;
+    for (let g = 0; g < form.groups.length; g++) {
+      const baseY = H * 0.25 + g * H * 0.16;
+
+      ctx.fillStyle = '#AAA';
+      ctx.font = `${H * 0.025}px sans-serif`;
+      ctx.fillText(`ライン${g + 1}`, W/2 - 150, baseY);
+
+      for (let p = 0; p < form.groups[g]; p++) {
+        const x = W/2 - 50 + p * 80;
+        const sel = posIdx === selectedPosition;
+        const posLabel = p === 0 ? '自力' : p === 1 ? '番手' : '3番手';
+
+        // Box
+        ctx.fillStyle = sel ? '#FFD700' : '#333';
+        ctx.fillRect(x - 30, baseY - 15, 60, 45);
+        ctx.strokeStyle = sel ? '#FFF' : '#555';
+        ctx.lineWidth = sel ? 2 : 1;
+        ctx.strokeRect(x - 30, baseY - 15, 60, 45);
+
+        // Cyclist icon
+        ctx.fillStyle = sel ? '#000' : COLORS[posIdx].main;
+        ctx.beginPath();
+        ctx.arc(x, baseY + 2, 10, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Number
+        ctx.fillStyle = sel ? '#000' : '#FFF';
+        ctx.font = `bold ${H * 0.018}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText(posIdx + 1, x, baseY + 7);
+
+        // Position label
+        ctx.fillStyle = sel ? '#FFD700' : '#888';
+        ctx.font = `${H * 0.015}px sans-serif`;
+        ctx.fillText(posLabel, x, baseY + 38);
+
+        posIdx++;
+      }
+    }
+
+    // Description
+    const selGroup = getGroupForPosition(selectedPosition, form);
+    const selPos = getPosInGroup(selectedPosition, form);
+    let desc = '';
+    if (selPos === 0) desc = '先頭を引く役割。体力消耗が多いがスタート位置が良い';
+    else if (selPos === 1) desc = '先頭の後ろ。スリップストリームを活用できる';
+    else desc = 'ラインの最後尾。最も体力を温存できる';
+
+    ctx.fillStyle = '#CCC';
+    ctx.font = `${H * 0.022}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(desc, W/2, H * 0.82);
+
+    ctx.fillStyle = '#888';
+    ctx.font = `${H * 0.025}px sans-serif`;
+    ctx.fillText('↑↓ 選択  → 決定  ← 戻る', W/2, H * 0.9);
+  }
+}
+
+function getGroupForPosition(pos, form) {
+  let count = 0;
+  for (let g = 0; g < form.groups.length; g++) {
+    if (pos < count + form.groups[g]) return g;
+    count += form.groups[g];
+  }
+  return 0;
+}
+
+function getPosInGroup(pos, form) {
+  let count = 0;
+  for (let g = 0; g < form.groups.length; g++) {
+    if (pos < count + form.groups[g]) return pos - count;
+    count += form.groups[g];
+  }
+  return 0;
+}
+
+// ===== RESULT SCREEN =====
+function renderResult() {
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#0a0a2a';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = '#FFD700';
+  ctx.font = `bold ${H * 0.06}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('レース結果', W/2, H * 0.1);
+
+  const playerPos = finishOrder.indexOf(playerIdx) + 1;
+  if (playerPos === 1) {
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${H * 0.04}px sans-serif`;
+    ctx.fillText('優勝おめでとう！', W/2, H * 0.18);
+  }
+
+  for (let i = 0; i < finishOrder.length; i++) {
+    const cidx = finishOrder[i];
+    const c = cyclists[cidx];
+    const y = H * 0.25 + i * H * 0.08;
+    const isPlayer = cidx === playerIdx;
+
+    ctx.fillStyle = isPlayer ? '#FFD700' : '#AAA';
+    ctx.font = `bold ${H * 0.03}px sans-serif`;
+    ctx.textAlign = 'left';
+
+    const posText = `${i + 1}位`;
+    const nameText = c.color.name;
+    const timeText = `${c.finishTime.toFixed(2)}秒`;
+    const marker = isPlayer ? ' ◀ YOU' : '';
+
+    ctx.fillText(posText, W * 0.25, y);
+
+    // Color dot
+    ctx.fillStyle = c.color.main;
+    ctx.beginPath();
+    ctx.arc(W * 0.35, y - 5, 8, 0, Math.PI * 2);
+    ctx.fill();
+    if (cidx === 1) { // black needs outline
+      ctx.strokeStyle = '#666';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = isPlayer ? '#FFD700' : '#CCC';
+    ctx.fillText(nameText, W * 0.4, y);
+    ctx.fillStyle = isPlayer ? '#FFD700' : '#888';
+    ctx.textAlign = 'right';
+    ctx.fillText(timeText + marker, W * 0.75, y);
+  }
+
+  const blink = Math.sin(Date.now() / 400) > 0;
+  if (blink) {
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${H * 0.03}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText('→キーでリトライ', W/2, H * 0.9);
+  }
+}
+
+// ===== INPUT HANDLING =====
+function handleInput() {
+  if (state === 'TITLE') {
+    if (justPressed('right')) {
+      state = 'LINE_SELECT';
+      selectPhase = 0;
+      selectedFormation = 0;
+      selectedPosition = 0;
+    }
+  } else if (state === 'LINE_SELECT') {
+    if (selectPhase === 0) {
+      if (justPressed('up')) selectedFormation = Math.max(0, selectedFormation - 1);
+      if (justPressed('down')) selectedFormation = Math.min(FORMATIONS.length - 1, selectedFormation + 1);
+      if (justPressed('right')) {
+        selectPhase = 1;
+        selectedPosition = 0;
+      }
+      if (justPressed('left')) state = 'TITLE';
+    } else {
+      const total = NUM_CYCLISTS;
+      if (justPressed('up')) selectedPosition = Math.max(0, selectedPosition - 1);
+      if (justPressed('down')) selectedPosition = Math.min(total - 1, selectedPosition + 1);
+      if (justPressed('right')) initRace();
+      if (justPressed('left')) selectPhase = 0;
+    }
+  } else if (state === 'RESULT') {
+    if (justPressed('right')) {
+      state = 'LINE_SELECT';
+      selectPhase = 0;
+    }
+  }
+}
+
+function renderPause() {
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#FFF';
+  ctx.font = `bold ${H * 0.07}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('PAUSE', W/2, H/2 - H * 0.03);
+  ctx.fillStyle = '#AAA';
+  ctx.font = `${H * 0.025}px sans-serif`;
+  ctx.fillText('スペースキーで再開', W/2, H/2 + H * 0.05);
+}
+
+// ===== MAIN LOOP =====
+let lastTime = 0;
+
+function gameLoop(time) {
+  const dt = Math.min(0.05, (time - lastTime) / 1000);
+  lastTime = time;
+
+  handleInput();
+  if (!paused) {
+    update(dt);
+    if (msgTimer > 0) msgTimer -= dt;
+  }
+  render();
+  if (paused) renderPause();
+
+  // Update prevKeys
+  prevKeys.up = keys.up;
+  prevKeys.down = keys.down;
+  prevKeys.left = keys.left;
+  prevKeys.right = keys.right;
+
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
