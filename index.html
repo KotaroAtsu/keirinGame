@@ -163,7 +163,7 @@ function project(wx, wy, wz, cam) {
   if (cz < 0.5) return null;
   const cx = dx*cam.rx + dy*cam.ry + dz*cam.rz;
   const cy = dx*cam.ux + dy*cam.uy + dz*cam.uz;
-  const fov = canvas.width * 1.0;
+  const fov = Math.min(canvas.width, canvas.height * 1.6) * 1.0;
   const scale = fov / cz;
   return {
     sx: canvas.width/2 + cx * scale,
