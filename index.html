@@ -142,7 +142,7 @@ function buildCamera(playerDist, playerLane) {
   const lookPos = worldPos(playerDist + CAM_LOOK, playerLane);
   const LOOK_RIGHT_OFFSET = 0.8; // 注視点も少し右寄り
   const lookX = lookPos.x + rightX * LOOK_RIGHT_OFFSET;
-  const lookY = lookPos.y + 1.5;
+  const lookY = lookPos.y - 0.5;
   const lookZ = lookPos.z + rightZ * LOOK_RIGHT_OFFSET;
   // Forward
   let fx = lookX - camX, fy = lookY - camY, fz = lookZ - camZ;
