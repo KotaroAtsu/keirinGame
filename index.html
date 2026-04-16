@@ -37,9 +37,18 @@ const PACER_LAPS = 1;
 const NUM_CYCLISTS = 7;
 
 const BASE_SPEED = 13.5;
-const MAX_SPEED = 20;
+const MAX_SPEED = 20.83;  // 75 km/h (絶対上限)
 const MIN_SPEED = 8;
 const EMPTY_SPEED = 11;
+const TOP_SPEED_MIN = 65 / 3.6;  // 18.06 m/s
+const TOP_SPEED_MAX = 75 / 3.6;  // 20.83 m/s
+
+// 選手タイプ定義
+const RIDER_TYPES = {
+  dash:    { name: 'ダッシュ', topSpeedRange: [72/3.6, 75/3.6], drainMult: 1.3 },
+  balance: { name: 'バランス', topSpeedRange: [68/3.6, 72/3.6], drainMult: 1.0 },
+  jizashi: { name: '地脚',    topSpeedRange: [65/3.6, 69/3.6], drainMult: 0.75 },
+};
 const STAMINA_MAX = 67;
 const STAMINA_DRAIN = 0.06;   // 速度比例の基本消費係数
 const SLIP_MULTIPLIER = 0.5;  // スリップ時: 消費50%減
@@ -53,9 +62,9 @@ const AIR_DRAG = 0.008;       // 空気抵抗係数 (風よけなし時)
 const AIR_DRAG_SLIP = 0.001;  // 空気抵抗係数 (スリップ時)
 const AIR_DRAG_COVER = 0.003; // 空気抵抗係数 (前方に選手あり)
 
-const CAM_DIST = 14;
-const CAM_H = 7;
-const CAM_LOOK = 18;
+const CAM_DIST = 9;
+const CAM_H = 4.5;
+const CAM_LOOK = 15;
 
 // ===== TRACK MATH =====
 const TRACK_OFFSET = 40; // スタート/ゴールを6時の位置(下端中央)にする
@@ -124,13 +133,17 @@ function buildCamera(playerDist, playerLane) {
   const pPos = worldPos(playerDist, playerLane);
   const t = ((playerDist % TL) + TL) % TL;
   const dir = trackDir(t);
-  const camX = pPos.x - dir.x * CAM_DIST;
+  // right vector (トラック面上の右方向)
+  const rightX = -dir.z, rightZ = dir.x;
+  const CAM_RIGHT_OFFSET = 1.8; // カメラを右にずらす
+  const camX = pPos.x - dir.x * CAM_DIST + rightX * CAM_RIGHT_OFFSET;
   const camY = pPos.y + CAM_H;
-  const camZ = pPos.z - dir.z * CAM_DIST;
+  const camZ = pPos.z - dir.z * CAM_DIST + rightZ * CAM_RIGHT_OFFSET;
   const lookPos = worldPos(playerDist + CAM_LOOK, playerLane);
-  const lookX = lookPos.x;
+  const LOOK_RIGHT_OFFSET = 0.8; // 注視点も少し右寄り
+  const lookX = lookPos.x + rightX * LOOK_RIGHT_OFFSET;
   const lookY = lookPos.y + 1.5;
-  const lookZ = lookPos.z;
+  const lookZ = lookPos.z + rightZ * LOOK_RIGHT_OFFSET;
   // Forward
   let fx = lookX - camX, fy = lookY - camY, fz = lookZ - camZ;
   let fl = Math.sqrt(fx*fx + fy*fy + fz*fz);
@@ -150,7 +163,7 @@ function project(wx, wy, wz, cam) {
   if (cz < 0.5) return null;
   const cx = dx*cam.rx + dy*cam.ry + dz*cam.rz;
   const cy = dx*cam.ux + dy*cam.uy + dz*cam.uz;
-  const fov = canvas.width * 0.75;
+  const fov = canvas.width * 1.0;
   const scale = fov / cz;
   return {
     sx: canvas.width/2 + cx * scale,
@@ -190,6 +203,9 @@ let finishOrder = [];
 let pacerActive = true;
 let paused = false;
 let keyJust = { up: false, down: false, left: false, right: false };
+let rouletteTimer = 0;
+let rouletteResult = '';
+let rouletteCycleSpeed = 0;
 
 const FORMATIONS = [
   { name: '3-3-1', groups: [3, 3, 1] },
@@ -208,7 +224,7 @@ document.addEventListener('keydown', e => {
     return;
   }
   if (e.key === 'Escape') {
-    if (state === 'RACING' || state === 'COUNTDOWN' || state === 'RESULT') {
+    if (state === 'RACING' || state === 'COUNTDOWN' || state === 'ROULETTE' || state === 'RESULT') {
       state = 'LINE_SELECT';
       selectPhase = 0;
       paused = false;
@@ -235,6 +251,11 @@ function justPressed(key) {
 
 // ===== CYCLIST =====
 function createCyclist(idx, dist, lane, isPlayer) {
+  // ランダムに選手タイプを決定
+  const typeKeys = Object.keys(RIDER_TYPES);
+  const typeKey = typeKeys[Math.floor(Math.random() * typeKeys.length)];
+  const rtype = RIDER_TYPES[typeKey];
+  const topSpeed = rtype.topSpeedRange[0] + Math.random() * (rtype.topSpeedRange[1] - rtype.topSpeedRange[0]);
   return {
     idx, dist, lane, speed: 0, stamina: STAMINA_MAX,
     targetLane: lane, isPlayer, prevY: 0, prevSpeed: 0,
@@ -246,6 +267,11 @@ function createCyclist(idx, dist, lane, isPlayer) {
     aiAggression: 0.7 + Math.random() * 0.3,
     lineGroup: 0, linePos: 0,
     abandoned: false, // 番手がラインを見切ったフラグ
+    // 選手タイプ
+    riderType: typeKey,
+    riderTypeName: rtype.name,
+    topSpeed: topSpeed,
+    staminaDrainMult: rtype.drainMult,
   };
 }
 
@@ -304,7 +330,7 @@ function initRace() {
     c.linePos = assignment.posInGroup;
     cyclists.push(c);
   }
-  playerIdx = 0;
+  playerIdx = cyclists.findIndex(c => c.isPlayer);
 
   // 戦法の割り当て
   // ライン先頭: senkou(先行), makuri(まくり), makuri_oikomi(捲り追込), tsuppari(突っ張り先行)
@@ -329,8 +355,11 @@ function initRace() {
   pacer.dist = 10;
   pacer.speed = 0;
 
-  state = 'COUNTDOWN';
-  countdown = 3.5;
+  // ルーレット演出へ（プレイヤーのタイプは後で確定）
+  state = 'ROULETTE';
+  rouletteTimer = 5.0; // 2.5秒回転 + 2.5秒確定表示
+  rouletteCycleSpeed = 0.08;
+  rouletteResult = '';
 }
 
 // ===== SLIPSTREAM CHECK =====
@@ -388,6 +417,15 @@ function isBlocked(cyclist, newLane) {
 
 // ===== UPDATE =====
 function update(dt) {
+  if (state === 'ROULETTE') {
+    rouletteTimer -= dt;
+    if (rouletteTimer <= 0) {
+      // ルーレット確定 → カウントダウンへ
+      state = 'COUNTDOWN';
+      countdown = 3.5;
+    }
+    return;
+  }
   if (state === 'COUNTDOWN') {
     countdown -= dt;
     if (countdown <= 0) {
@@ -460,7 +498,7 @@ function update(dt) {
       if (raceSprintPhase) {
         // Speed control: 上で加速、下で減速、離すと速度維持（空気抵抗で徐々に減速）
         if (keys.up && c.stamina > 0) {
-          c.speed = Math.min(MAX_SPEED, c.speed + ACCEL_RATE * dt);
+          c.speed = Math.min(c.topSpeed, c.speed + ACCEL_RATE * dt);
         } else if (keys.down) {
           c.speed = Math.max(MIN_SPEED, c.speed - DECEL_RATE * dt);
         }
@@ -471,17 +509,17 @@ function update(dt) {
         else drag = AIR_DRAG;
         c.speed = Math.max(MIN_SPEED, c.speed - drag * c.speed * c.speed * dt);
 
-        if (c.stamina <= 0) c.speed = Math.min(c.speed, EMPTY_SPEED);
+        // 体力0: 加速不可（上キーは既にstamina>0で制限済み）、惰性で走り空気抵抗で減速
 
         // Stamina
-        let drain = c.speed * STAMINA_DRAIN * dt;
+        let drain = c.speed * STAMINA_DRAIN * c.staminaDrainMult * dt;
         if (slip) drain *= SLIP_MULTIPLIER;
         else if (!hasAnyoneAhead(c)) drain *= WIND_PENALTY;
         c.stamina = Math.max(0, c.stamina - drain);
       } else {
         // 誘導中: 自由に加減速できるが、誘導員は追い抜けない
         if (keys.up) {
-          c.speed = Math.min(MAX_SPEED, c.speed + ACCEL_RATE * dt);
+          c.speed = Math.min(c.topSpeed, c.speed + ACCEL_RATE * dt);
         } else if (keys.down) {
           c.speed = Math.max(0, c.speed - DECEL_RATE * dt);
         }
@@ -524,7 +562,7 @@ function update(dt) {
           const gapError = gap - idealGap;
           let targetSpeed = lineAhead.speed + gapError * 4.0;
           // ライン前方選手についていく（誘導員速度でキャップしない）
-          targetSpeed = Math.max(0, Math.min(targetSpeed, MAX_SPEED));
+          targetSpeed = Math.max(0, Math.min(targetSpeed, c.topSpeed));
           c.speed += (targetSpeed - c.speed) * Math.min(1, dt / REACTION_DELAY);
           // ただし誘導員を追い抜かない
           const distToPacer = pacer.dist - c.dist;
@@ -551,10 +589,12 @@ function update(dt) {
           if (c.dist > pacer.dist - 2) {
             c.speed = Math.min(c.speed, pacer.speed * 0.85);
           }
-          // フォーメーションレーン
-          const formLane = 2 + c.lineGroup * 0.8;
-          if (c.lane < formLane - 0.1) c.lane += LANE_SPEED * 0.5 * dt;
-          if (c.lane > formLane + 0.1) c.lane -= LANE_SPEED * 0.5 * dt;
+          // フォーメーションレーン（縦に十分散らばってから合流）
+          if (c.dist > TL / 8) {
+            const formLane = 2 + c.lineGroup * 0.8;
+            if (c.lane < formLane - 0.1) c.lane += LANE_SPEED * 0.5 * dt;
+            if (c.lane > formLane + 0.1) c.lane -= LANE_SPEED * 0.5 * dt;
+          }
         }
       }
     }
@@ -564,7 +604,11 @@ function update(dt) {
     // 同レーンの前方選手をすり抜けない（横に出さないと抜けない）
     for (const other of cyclists) {
       if (other === c || other.finished) continue;
-      if (other.lineGroup === c.lineGroup) continue; // 同ラインは除外
+      // 同ライン衝突: AIは除外（追従ロジックが車間管理）、プレイヤーはライン前方の選手のみ衝突
+      if (other.lineGroup === c.lineGroup) {
+        if (!c.isPlayer) continue;
+        if (other.linePos >= c.linePos) continue;
+      }
       const laneDiff = Math.abs(other.lane - c.lane);
       if (laneDiff < 0.9) { // 同レーンにいる場合
         const distAhead = other.dist - c.dist;
@@ -685,7 +729,7 @@ function updateFollower(c, ahead, dt, slip, remaining) {
   if (c.aiTactic === 'sashi' && remaining < TL * 0.35 && c.stamina > 10) {
     // ライン先頭を超える速度で差しにいく
     const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
-    let targetSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 0.5))));
+    let targetSpeed = Math.min(c.topSpeed, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 0.5))));
     applySpeed(c, targetSpeed, dt, slip);
     // 差しはインコースから: 前の選手より内側を狙う
     const sashiLane = Math.max(1, ahead.lane - 1.2);
@@ -704,14 +748,14 @@ function updateFollower(c, ahead, dt, slip, remaining) {
   const gapError = gap - idealGap;
   let targetSpeed = ahead.speed + gapError * 5.0;
 
-  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, EMPTY_SPEED);
-  targetSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, targetSpeed));
+  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, c.speed); // 加速不可、現速度以下のみ
+  targetSpeed = Math.max(MIN_SPEED, Math.min(c.topSpeed, targetSpeed));
 
   const smoothing = Math.min(1, dt / REACTION_DELAY);
   c.speed += (targetSpeed - c.speed) * smoothing;
 
   // === 体力消費 ===
-  let drain = c.speed * STAMINA_DRAIN * dt;
+  let drain = c.speed * STAMINA_DRAIN * c.staminaDrainMult * dt;
   if (slip) drain *= SLIP_MULTIPLIER;
   else if (!hasAnyoneAhead(c)) drain *= WIND_PENALTY;
   c.stamina = Math.max(0, c.stamina - drain);
@@ -728,17 +772,17 @@ function updateFollower(c, ahead, dt, slip, remaining) {
 function updateLeader(c, dt, slip, remaining) {
   let targetSpeed;
   const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
-  const burnSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 1))));
+  const burnSpeed = Math.min(c.topSpeed, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 1))));
 
   if (c.aiTactic === 'senkou') {
     // === 先行: 誘導退避後すぐに前に出て逃げ切りを狙う ===
     if (remaining > TL * 1.5) {
       const intensity = c.aiAggression * 0.75;
-      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else if (remaining > TL * 0.5) {
       const staminaRatio = c.stamina / STAMINA_MAX;
       const intensity = c.aiAggression * Math.min(0.7, staminaRatio);
-      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else {
       targetSpeed = burnSpeed;
     }
@@ -748,11 +792,11 @@ function updateLeader(c, dt, slip, remaining) {
     if (remaining > TL * 1.5) {
       // 先行開始（やや控えめに入る）
       const intensity = c.aiAggression * 0.65;
-      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else if (remaining > TL * 0.5) {
       // 後ろから追い上げがあっても踏み続ける
       const staminaRatio = c.stamina / STAMINA_MAX;
-      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * c.aiAggression * Math.min(0.65, staminaRatio);
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * c.aiAggression * Math.min(0.65, staminaRatio);
       // 後ろから来たら意地でも上げる
       let chaserSpeed = 0;
       for (const other of cyclists) {
@@ -770,11 +814,13 @@ function updateLeader(c, dt, slip, remaining) {
   } else if (c.aiTactic === 'makuri') {
     // === まくり: 他ラインに先行させ、残り1周あたりから外から一気にまくる ===
     if (remaining > TL * 1.0) {
-      targetSpeed = BASE_SPEED + (slip ? 0.3 : 1.0);
+      // 温存フェーズ: 集団についていく程度の速度
+      const intensity = c.aiAggression * 0.4;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else if (remaining > TL * 0.5) {
       const progress = 1 - (remaining - TL * 0.5) / (TL * 0.5);
       const intensity = c.aiAggression * (0.5 + progress * 0.5);
-      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else {
       targetSpeed = burnSpeed;
     }
@@ -782,27 +828,28 @@ function updateLeader(c, dt, slip, remaining) {
   } else {
     // === 捲り追込み(makuri_oikomi): まくりよりさらに遅いタイミングで仕掛ける ===
     if (remaining > TL * 0.7) {
-      // 長く温存、3〜4番手あたりでスリップ
-      targetSpeed = BASE_SPEED + (slip ? 0.2 : 0.8);
+      // 温存フェーズ: 集団から離れない程度に走る
+      const intensity = c.aiAggression * 0.35;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else if (remaining > TL * 0.35) {
       // 仕掛け開始: 一気に外からまくる
       const progress = 1 - (remaining - TL * 0.35) / (TL * 0.35);
       const intensity = c.aiAggression * (0.6 + progress * 0.4);
-      targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
+      targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
     } else {
       targetSpeed = burnSpeed;
     }
   }
 
-  // 周囲への反応: 誰かがスパートしたら対応
+  // 周囲への反応: 誰かがスパートしたら対応 / 集団から離されない
   let fastestNearby = 0;
   for (const other of cyclists) {
     if (other === c || other.finished) continue;
     const d = other.dist - c.dist;
-    if (d > -5 && d < 15 && other.speed > fastestNearby) fastestNearby = other.speed;
+    if (d > -5 && d < 20 && other.speed > fastestNearby) fastestNearby = other.speed;
   }
-  if (fastestNearby > c.speed + 2 && c.stamina > 5) {
-    targetSpeed = Math.max(targetSpeed, fastestNearby - 0.3);
+  if (fastestNearby > c.speed + 0.5 && c.stamina > 5) {
+    targetSpeed = Math.max(targetSpeed, fastestNearby - 0.5);
   }
 
   applySpeed(c, targetSpeed, dt, slip);
@@ -814,21 +861,21 @@ function updateIndependent(c, dt, slip, remaining) {
   let targetSpeed;
   if (remaining > TL * 0.5) {
     const staminaRatio = c.stamina / STAMINA_MAX;
-    const intensity = c.aiAggression * staminaRatio * 0.6;
-    targetSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * intensity;
-    if (slip) targetSpeed = Math.min(targetSpeed, BASE_SPEED + 2);
+    const intensity = c.aiAggression * Math.min(0.7, staminaRatio);
+    targetSpeed = BASE_SPEED + (c.topSpeed - BASE_SPEED) * intensity;
   } else {
     const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
-    targetSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 1))));
+    targetSpeed = Math.min(c.topSpeed, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 1))));
   }
+  // 集団から離されない
   let fastestNearby = 0;
   for (const other of cyclists) {
     if (other === c || other.finished) continue;
     const d = other.dist - c.dist;
-    if (d > -5 && d < 15 && other.speed > fastestNearby) fastestNearby = other.speed;
+    if (d > -5 && d < 20 && other.speed > fastestNearby) fastestNearby = other.speed;
   }
-  if (fastestNearby > c.speed + 2 && c.stamina > 5) {
-    targetSpeed = Math.max(targetSpeed, fastestNearby - 0.3);
+  if (fastestNearby > c.speed + 0.5 && c.stamina > 5) {
+    targetSpeed = Math.max(targetSpeed, fastestNearby - 0.5);
   }
   applySpeed(c, targetSpeed, dt, slip);
   applyLane(c, dt);
@@ -837,18 +884,18 @@ function updateIndependent(c, dt, slip, remaining) {
 // ===== ラスト1/4周: 全員全力スプリント =====
 function updateFinalSprint(c, dt, slip, remaining) {
   const timeToFinish = remaining / Math.max(c.speed, BASE_SPEED);
-  let targetSpeed = Math.min(MAX_SPEED, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 0.5))));
-  if (c.stamina <= 0) targetSpeed = EMPTY_SPEED;
+  let targetSpeed = Math.min(c.topSpeed, BASE_SPEED + (c.stamina / (STAMINA_DRAIN * Math.max(timeToFinish, 0.5))));
+  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, c.speed); // 加速不可
   applySpeed(c, targetSpeed, dt, slip);
   applyLane(c, dt);
 }
 
 // ===== 速度適用（共通） =====
 function applySpeed(c, targetSpeed, dt, slip) {
-  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, EMPTY_SPEED);
-  targetSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, targetSpeed));
+  if (c.stamina <= 0) targetSpeed = Math.min(targetSpeed, c.speed); // 加速不可、惰性走行
+  targetSpeed = Math.max(MIN_SPEED, Math.min(c.topSpeed, targetSpeed));
   c.speed += (targetSpeed - c.speed) * Math.min(1, dt * 3);
-  let drain = c.speed * STAMINA_DRAIN * dt;
+  let drain = c.speed * STAMINA_DRAIN * c.staminaDrainMult * dt;
   if (slip) drain *= SLIP_MULTIPLIER;
   else if (!hasAnyoneAhead(c)) drain *= WIND_PENALTY;
   c.stamina = Math.max(0, c.stamina - drain);
@@ -968,6 +1015,7 @@ function render() {
 
   if (state === 'TITLE') return renderTitle();
   if (state === 'LINE_SELECT') return renderLineSelect();
+  if (state === 'ROULETTE') return renderRoulette();
   if (state === 'RESULT') return renderResult();
 
   // Racing / Countdown
@@ -1132,7 +1180,7 @@ function renderCyclists(cam) {
     const wp = worldPos(c.dist, c.lane);
     const pp = project(wp.x, wp.y + 0.8, wp.z, cam);
     if (pp && pp.depth > 0) {
-      entities.push({ proj: pp, color: c.color, stamina: c.stamina, isPlayer: c.isPlayer, isSlip: inSlipstream(c), dist: c.dist, idx: c.idx, speed: c.speed, accel: c.speed - c.prevSpeed });
+      entities.push({ proj: pp, color: c.color, stamina: c.stamina, isPlayer: c.isPlayer, isSlip: inSlipstream(c), dist: c.dist, idx: c.idx, speed: c.speed, accel: c.speed - c.prevSpeed, riderType: c.riderType, riderTypeName: c.riderTypeName });
     }
   }
 
@@ -1361,6 +1409,20 @@ function renderCyclists(cam) {
       ctx.textBaseline = 'middle';
       ctx.fillText(e.idx + 1, sx, (shoulderY + hipY) / 2);
     }
+
+    // === 選手タイプラベル（体力バーの上） ===
+    if (s > 15 && e.riderType) {
+      const tColor = e.riderType === 'dash' ? '#FF6666' : e.riderType === 'jizashi' ? '#66BBFF' : '#AAFFAA';
+      const labelSize = Math.max(7, u * 1.5);
+      const labelY = e.isPlayer ? headY - headR - u * 5.5 : headY - headR - u * 2.8;
+      ctx.font = `bold ${labelSize}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      const tw = ctx.measureText(e.riderTypeName).width + 4;
+      ctx.fillRect(sx - tw/2, labelY - labelSize * 0.65, tw, labelSize * 0.9);
+      ctx.fillStyle = tColor;
+      ctx.fillText(e.riderTypeName, sx, labelY);
+    }
   }
 }
 
@@ -1391,13 +1453,21 @@ function renderHUD(player) {
   ctx.textAlign = 'center';
   ctx.fillText(`${pos}位`, W/2, 38);
 
-  // Speed (top right)
+  // Speed & rider type (top right)
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(W - 170, 10, 160, 50);
+  ctx.fillRect(W - 210, 10, 200, 80);
   ctx.fillStyle = '#FFF';
-  ctx.font = 'bold 22px sans-serif';
+  ctx.font = 'bold 24px sans-serif';
   ctx.textAlign = 'right';
   ctx.fillText(`${speed.toFixed(1)} km/h`, W - 20, 38);
+  // 選手タイプ・トップスピード表示
+  const tColor = player.riderType === 'dash' ? '#FF6666' : player.riderType === 'jizashi' ? '#66BBFF' : '#AAFFAA';
+  ctx.fillStyle = tColor;
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText(`${player.riderTypeName}型`, W - 20, 62);
+  ctx.fillStyle = '#CCC';
+  ctx.font = '14px sans-serif';
+  ctx.fillText(`max ${(player.topSpeed * 3.6).toFixed(1)} km/h`, W - 20, 80);
 
   // Stamina bar (bottom center)
   const barW = Math.min(400, W * 0.4);
@@ -1447,7 +1517,7 @@ function getPlayerPosition() {
 
 function renderMinimap() {
   const W = canvas.width, H = canvas.height;
-  const mapW = 140, mapH = 100;
+  const mapW = 220, mapH = 160;
   const mapX = W - mapW - 15, mapY = H - mapH - 15;
 
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
@@ -1460,7 +1530,7 @@ function renderMinimap() {
 
   // Draw track outline
   ctx.strokeStyle = '#666';
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 4;
   ctx.beginPath();
   for (let i = 0; i <= 200; i++) {
     const t = (i / 200) * TL;
@@ -1481,7 +1551,7 @@ function renderMinimap() {
 
     ctx.fillStyle = c.isPlayer ? '#FFD700' : c.color.main;
     ctx.beginPath();
-    ctx.arc(mx, my, c.isPlayer ? 4 : 3, 0, Math.PI * 2);
+    ctx.arc(mx, my, c.isPlayer ? 6 : 4, 0, Math.PI * 2);
     ctx.fill();
     if (c.isPlayer) {
       ctx.strokeStyle = '#FFF';
@@ -1498,7 +1568,7 @@ function renderMinimap() {
     const my = cy - p.z * sc;
     ctx.fillStyle = '#9933CC';
     ctx.beginPath();
-    ctx.arc(mx, my, 3, 0, Math.PI * 2);
+    ctx.arc(mx, my, 4, 0, Math.PI * 2);
     ctx.fill();
   }
 }
@@ -1515,6 +1585,129 @@ function renderMessages() {
     ctx.lineWidth = 4;
     ctx.strokeText(message, W/2, H * 0.35);
     ctx.fillText(message, W/2, H * 0.35);
+  }
+}
+
+// ===== ROULETTE SCREEN =====
+function renderRoulette() {
+  const W = canvas.width, H = canvas.height;
+  const player = cyclists[playerIdx];
+
+  // 背景
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0a0a2a');
+  grad.addColorStop(0.5, '#1a1a4a');
+  grad.addColorStop(1, '#0a0a2a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  const typeKeys = Object.keys(RIDER_TYPES);
+  const spinDuration = 2.5;   // 回転フェーズ
+  const showDuration = 2.5;   // 確定表示フェーズ
+  const totalDuration = spinDuration + showDuration;
+  const elapsed = totalDuration - rouletteTimer;
+  const isDecided = elapsed >= spinDuration;
+
+  // ルーレット中: 徐々に遅くなりながら切り替え
+  let displayKey;
+  if (!isDecided) {
+    const progress = elapsed / spinDuration; // 0→1
+    const cycleInterval = 0.08 + progress * progress * 0.5; // 徐々に遅く
+    const cycleIdx = Math.floor(elapsed / Math.max(0.05, cycleInterval));
+    const displayIdx = cycleIdx % typeKeys.length;
+    displayKey = typeKeys[displayIdx];
+  } else {
+    displayKey = player.riderType;
+  }
+  const displayType = RIDER_TYPES[displayKey];
+
+  // タイトル
+  ctx.fillStyle = '#FFD700';
+  ctx.font = `bold ${H * 0.06}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('選手タイプ決定', W/2, H * 0.15);
+
+  // ルーレット枠
+  const boxW = W * 0.5, boxH = H * 0.18;
+  const boxX = W/2 - boxW/2, boxY = H * 0.25;
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.strokeStyle = isDecided ? '#FFD700' : '#555';
+  ctx.lineWidth = isDecided ? 4 : 2;
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+  // タイプ名（大きく）
+  const typeColor = displayKey === 'dash' ? '#FF6666' : displayKey === 'jizashi' ? '#66BBFF' : '#AAFFAA';
+  ctx.fillStyle = typeColor;
+  ctx.font = `bold ${H * 0.09}px sans-serif`;
+  ctx.fillText(`${displayType.name}型`, W/2, boxY + boxH * 0.4);
+
+  // トップスピード
+  if (isDecided) {
+    ctx.fillStyle = '#FFF';
+    ctx.font = `bold ${H * 0.04}px sans-serif`;
+    ctx.fillText(`最高速度: ${(player.topSpeed * 3.6).toFixed(1)} km/h`, W/2, boxY + boxH * 0.78);
+  } else {
+    // ルーレット中は仮の速度をランダムに見せる
+    const fakeSpeed = displayType.topSpeedRange[0] + Math.random() * (displayType.topSpeedRange[1] - displayType.topSpeedRange[0]);
+    ctx.fillStyle = '#AAA';
+    ctx.font = `${H * 0.035}px sans-serif`;
+    ctx.fillText(`最高速度: ${(fakeSpeed * 3.6).toFixed(1)} km/h`, W/2, boxY + boxH * 0.78);
+  }
+
+  // 確定演出
+  if (isDecided) {
+    const flash = Math.sin(Date.now() * 0.01) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255,215,0,${flash * 0.15})`;
+    ctx.fillRect(boxX, boxY, boxW, boxH);
+  }
+
+  // タイプ説明
+  const descY = boxY + boxH + H * 0.06;
+  ctx.font = `${H * 0.03}px sans-serif`;
+  ctx.fillStyle = '#CCC';
+  if (displayKey === 'dash') {
+    ctx.fillText('トップスピードが高いが、体力の消耗が激しい', W/2, descY);
+  } else if (displayKey === 'jizashi') {
+    ctx.fillText('トップスピードは控えめだが、体力の消耗が緩やか', W/2, descY);
+  } else {
+    ctx.fillText('スピードと体力のバランスが取れたタイプ', W/2, descY);
+  }
+
+  // 全選手のタイプ一覧
+  const listY = descY + H * 0.08;
+  ctx.fillStyle = '#FFD700';
+  ctx.font = `bold ${H * 0.03}px sans-serif`;
+  ctx.fillText('出走選手', W/2, listY);
+
+  const colW = W * 0.7 / 4;
+  const startX = W/2 - (Math.min(4, cyclists.length) * colW) / 2;
+  const rowH = H * 0.045;
+
+  for (let i = 0; i < cyclists.length; i++) {
+    const c = cyclists[i];
+    const col = i % 4;
+    const row = Math.floor(i / 4);
+    const cx = startX + col * colW + colW / 2;
+    const cy = listY + H * 0.04 + row * rowH;
+
+    // 番号と色
+    ctx.fillStyle = c.color.main;
+    ctx.font = `bold ${H * 0.025}px sans-serif`;
+    ctx.textAlign = 'center';
+    const tColor = c.riderType === 'dash' ? '#FF6666' : c.riderType === 'jizashi' ? '#66BBFF' : '#AAFFAA';
+
+    if (c.isPlayer) {
+      // プレイヤーはハイライト
+      ctx.fillStyle = '#FFD700';
+      ctx.fillText(`★${i + 1}番`, cx - colW * 0.15, cy);
+    } else {
+      ctx.fillText(`${i + 1}番`, cx - colW * 0.15, cy);
+    }
+    ctx.fillStyle = tColor;
+    ctx.font = `${H * 0.022}px sans-serif`;
+    ctx.fillText(`${RIDER_TYPES[c.riderType].name}`, cx + colW * 0.2, cy);
   }
 }
 
